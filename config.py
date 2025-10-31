@@ -4,7 +4,7 @@ class IntegrationConfig:
     """Configuration for NBA-DFS-Tools integration"""
     
     # Paths
-    NBA_DFS_TOOLS_PATH = "/path/to/NBA-DFS-Tools"
+    NBA_DFS_TOOLS_PATH = "/home/iamgeneral/Documents/git/HomeGrownNBAProjections/NBA-DFS-Tools"
     OUTPUT_DIR = "./output"
     
     # Projection settings
