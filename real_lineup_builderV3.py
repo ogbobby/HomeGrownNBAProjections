@@ -3,7 +3,7 @@ import pandas as pd
 import pulp
 from nba_api.stats.endpoints import commonplayerinfo, playergamelogs, scoreboardv2, teamgamelogs, leaguedashteamstats
 from nba_api.stats.static import teams, players
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 import os
 import time
@@ -15,6 +15,8 @@ class EnhancedProjectionsNBAData:
         self.team_id_map = {}
         self.team_stats = {}
         self.game_pace_data = {}
+        self.matchup_data = {}
+        self.team_game_schedule = {}
         self.dk_salaries_path = dk_salaries_path
         self.dk_salaries_df = None
         self.setup_team_map()
@@ -100,8 +102,8 @@ class EnhancedProjectionsNBAData:
             return False
 
     def calculate_game_pace(self):
-        """Calculate projected pace for today's games"""
-        print("   Calculating game pace projections...")
+        """Calculate projected pace for today's games and store matchup data"""
+        print("   Calculating game pace projections and matchups...")
         
         try:
             # For each game, calculate combined pace factor
@@ -120,18 +122,120 @@ class EnhancedProjectionsNBAData:
                     away_pace = self.team_stats.get(away_team, {}).get('pace', 100.0)
                     avg_pace = (home_pace + away_pace) / 2
                     
+                    # Get defensive ratings for matchup analysis
+                    home_def_rating = self.team_stats.get(home_team, {}).get('def_rating', 110.0)
+                    away_def_rating = self.team_stats.get(away_team, {}).get('def_rating', 110.0)
+                    
+                    # Calculate matchup difficulty
+                    matchup_difficulty = self.calculate_matchup_difficulty(home_team, away_team)
+                    
                     self.game_pace_data[f"{away_team}@{home_team}"] = {
                         'pace': avg_pace,
                         'home_team': home_team,
                         'away_team': away_team,
                         'home_pace': home_pace,
-                        'away_pace': away_pace
+                        'away_pace': away_pace,
+                        'home_def_rating': home_def_rating,
+                        'away_def_rating': away_def_rating,
+                        'matchup_difficulty': matchup_difficulty
                     }
                     
-                    print(f"      {away_team} @ {home_team}: Projected Pace {avg_pace:.1f}")
+                    # Store individual team matchups
+                    self.matchup_data[home_team] = {
+                        'opponent': away_team,
+                        'location': 'home',
+                        'pace': avg_pace,
+                        'opp_def_rating': away_def_rating,
+                        'matchup_difficulty': matchup_difficulty['home_difficulty']
+                    }
+                    
+                    self.matchup_data[away_team] = {
+                        'opponent': home_team,
+                        'location': 'away',
+                        'pace': avg_pace,
+                        'opp_def_rating': home_def_rating,
+                        'matchup_difficulty': matchup_difficulty['away_difficulty']
+                    }
+                    
+                    print(f"      {away_team} @ {home_team}: Pace {avg_pace:.1f}, Home Def: {home_def_rating:.1f}, Away Def: {away_def_rating:.1f}")
                     
         except Exception as e:
             print(f"❌ Error calculating game pace: {e}")
+
+    def calculate_matchup_difficulty(self, home_team, away_team):
+        """Calculate matchup difficulty for both teams"""
+        try:
+            home_def = self.team_stats.get(home_team, {}).get('def_rating', 110.0)
+            away_def = self.team_stats.get(away_team, {}).get('def_rating', 110.0)
+            
+            # League average defense rating (lower is better defense)
+            league_avg_def = 110.0
+            
+            # Calculate difficulty (higher number = harder matchup)
+            home_difficulty = (away_def - league_avg_def) / 10  # Positive = easier, Negative = harder
+            away_difficulty = (home_def - league_avg_def) / 10  # Positive = easier, Negative = harder
+            
+            return {
+                'home_difficulty': home_difficulty,
+                'away_difficulty': away_difficulty
+            }
+        except:
+            return {'home_difficulty': 0, 'away_difficulty': 0}
+
+    def get_team_game_schedule(self):
+        """Get recent game schedule for all teams to check for back-to-backs"""
+        print("   Getting team schedule data for back-to-back checking...")
+        
+        try:
+            # Get last 7 days of games to check for back-to-backs
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=7)
+            
+            # Format dates for API
+            date_from = start_date.strftime('%Y-%m-%d')
+            date_to = end_date.strftime('%Y-%m-%d')
+            
+            team_logs = teamgamelogs.TeamGameLogs(
+                season_nullable='2024-25',
+                date_from_nullable=date_from,
+                date_to_nullable=date_to
+            )
+            schedule_df = team_logs.get_data_frames()[0]
+            
+            # Organize games by team
+            for _, game in schedule_df.iterrows():
+                team_abbr = game['TEAM_ABBREVIATION']
+                game_date = pd.to_datetime(game['GAME_DATE'])
+                
+                if team_abbr not in self.team_game_schedule:
+                    self.team_game_schedule[team_abbr] = []
+                
+                self.team_game_schedule[team_abbr].append(game_date)
+            
+            print(f"✅ Loaded schedule data for {len(self.team_game_schedule)} teams")
+            
+        except Exception as e:
+            print(f"❌ Error getting team schedule: {e}")
+
+    def check_back_to_back(self, team):
+        """Check if a team is on a back-to-back"""
+        try:
+            if team not in self.team_game_schedule:
+                return False
+            
+            team_games = sorted(self.team_game_schedule[team])
+            if len(team_games) < 2:
+                return False
+            
+            # Check if last game was yesterday
+            last_game_date = team_games[-1]
+            today = datetime.now().date()
+            
+            # If last game was yesterday, it's a back-to-back
+            return (last_game_date.date() == today - timedelta(days=1))
+            
+        except:
+            return False
 
     def get_todays_games(self):
         """Get today's NBA games to filter for active players"""
@@ -185,6 +289,9 @@ class EnhancedProjectionsNBAData:
         # Get team stats and pace data
         if not self.get_team_stats_and_pace():
             print("⚠️  Continuing without team pace data")
+        
+        # Get team schedule for back-to-back checking
+        self.get_team_game_schedule()
         
         try:
             season = self.get_current_season()
@@ -254,6 +361,19 @@ class EnhancedProjectionsNBAData:
         print(f"   ✅ Found {len(players_with_teams)} players with team information")
         return players_with_teams
 
+    def debug_column_check(self, all_logs_df):
+        """Debug method to check available columns"""
+        print("🔍 Available columns in game logs:")
+        print(list(all_logs_df.columns))
+        
+        # Check a sample row to see actual data
+        if not all_logs_df.empty:
+            sample_row = all_logs_df.iloc[0]
+            print("🔍 Sample row data:")
+            for col in ['PLAYER_ID', 'PLAYER_NAME', 'MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV']:
+                if col in sample_row.index:
+                    print(f"   {col}: {sample_row[col]}")
+
     def get_enhanced_player_projections(self, season):
         """Get player stats with enhanced projections including minutes and pace"""
         print("🔄 Getting enhanced player projections...")
@@ -286,6 +406,10 @@ class EnhancedProjectionsNBAData:
             all_game_logs = playergamelogs.PlayerGameLogs(season_nullable=season)
             all_logs_df = all_game_logs.get_data_frames()[0]
             print(f"   📈 Loaded {len(all_logs_df)} total game logs")
+            
+            # Debug: Check columns
+            self.debug_column_check(all_logs_df)
+            
         except Exception as e:
             print(f"❌ Error loading game logs: {e}")
             return []
@@ -317,6 +441,12 @@ class EnhancedProjectionsNBAData:
                 if len(recent_games) < 3:
                     continue
                 
+                # Health check - ensure we have required columns
+                required_columns = ['MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV']
+                missing_columns = [col for col in required_columns if col not in recent_games.columns]
+                if missing_columns:
+                    continue
+                
                 # Health check
                 most_recent_game = recent_games.iloc[0]
                 game_date = pd.to_datetime(most_recent_game['GAME_DATE'])
@@ -344,27 +474,133 @@ class EnhancedProjectionsNBAData:
                     processed_count += 1
                     
             except Exception as e:
+                # Only print errors for debugging if needed
+                # print(f"      Error processing {player.get('full_name', 'Unknown')}: {e}")
                 continue
         
         print(f"   ✅ Processed {processed_count} players with enhanced projections")
         return player_data
 
-    def calculate_enhanced_projection(self, player, recent_games, position, team, dk_salary_info):
-        """Calculate enhanced fantasy projection with minutes, pace, usage rate, points per minute, plus/minus, and bargain rating"""
+    def calculate_robust_averages(self, recent_games):
+        """Calculate more robust averages using median and trimmed means"""
         try:
-            # Calculate base averages from recent games
-            avg_stats = {
-                'points': recent_games['PTS'].mean(),
-                'rebounds': recent_games['REB'].mean(),
-                'assists': recent_games['AST'].mean(),
-                'steals': recent_games['STL'].mean(),
-                'blocks': recent_games['BLK'].mean(),
-                'turnovers': recent_games['TOV'].mean(),
-                'minutes': recent_games['MIN'].mean(),
-                'field_goals_attempted': recent_games['FGA'].mean(),
-                'free_throws_attempted': recent_games['FTA'].mean(),
+            # Use median for minutes to avoid outlier games skewing projections
+            median_minutes = recent_games['MIN'].median()
+            
+            # Calculate trimmed mean (remove best and worst game) for stats
+            stats = {}
+            
+            # Map of our stat names to NBA API column names
+            stat_mapping = {
+                'points': 'PTS',
+                'rebounds': 'REB', 
+                'assists': 'AST',
+                'steals': 'STL',
+                'blocks': 'BLK',
+                'turnovers': 'TOV',
+                'field_goals_attempted': 'FGA',
+                'free_throws_attempted': 'FTA',
+                'plus_minus': 'PLUS_MINUS'
+            }
+            
+            for stat_key, nba_column in stat_mapping.items():
+                if nba_column in recent_games.columns:
+                    values = sorted(recent_games[nba_column].tolist())
+                    if len(values) >= 5:
+                        # Remove best and worst game
+                        trimmed_values = values[1:-1]
+                        stats[stat_key] = sum(trimmed_values) / len(trimmed_values)
+                    else:
+                        stats[stat_key] = recent_games[nba_column].mean()
+                else:
+                    stats[stat_key] = 0
+            
+            stats['minutes'] = median_minutes
+            return stats
+            
+        except Exception as e:
+            print(f"      Error in robust averages: {e}")
+            # Fallback to simple averages
+            return {
+                'points': recent_games['PTS'].mean() if 'PTS' in recent_games.columns else 0,
+                'rebounds': recent_games['REB'].mean() if 'REB' in recent_games.columns else 0,
+                'assists': recent_games['AST'].mean() if 'AST' in recent_games.columns else 0,
+                'steals': recent_games['STL'].mean() if 'STL' in recent_games.columns else 0,
+                'blocks': recent_games['BLK'].mean() if 'BLK' in recent_games.columns else 0,
+                'turnovers': recent_games['TOV'].mean() if 'TOV' in recent_games.columns else 0,
+                'minutes': recent_games['MIN'].mean() if 'MIN' in recent_games.columns else 0,
+                'field_goals_attempted': recent_games['FGA'].mean() if 'FGA' in recent_games.columns else 0,
+                'free_throws_attempted': recent_games['FTA'].mean() if 'FTA' in recent_games.columns else 0,
                 'plus_minus': recent_games['PLUS_MINUS'].mean() if 'PLUS_MINUS' in recent_games.columns else 0
             }
+
+    def calculate_volatility_score(self, recent_games):
+        """Calculate how volatile a player's production is"""
+        try:
+            if len(recent_games) < 3:
+                return 1.0
+            
+            # Calculate fantasy points for each game
+            game_scores = []
+            for _, game in recent_games.iterrows():
+                fp = self.calculate_dk_points({
+                    'points': game['PTS'],
+                    'rebounds': game['REB'],
+                    'assists': game['AST'],
+                    'steals': game['STL'],
+                    'blocks': game['BLK'],
+                    'turnovers': game['TOV']
+                })
+                game_scores.append(fp)
+            
+            # Calculate coefficient of variation (standard deviation / mean)
+            mean_score = sum(game_scores) / len(game_scores)
+            if mean_score == 0:
+                return 1.0
+                
+            std_dev = (sum((x - mean_score) ** 2 for x in game_scores) / len(game_scores)) ** 0.5
+            volatility = std_dev / mean_score
+            
+            return min(2.0, max(0.1, volatility))
+            
+        except:
+            return 1.0
+
+    def calculate_consistency_rating(self, recent_games):
+        """Calculate consistency rating (0-100) based on performance stability"""
+        try:
+            if len(recent_games) < 3:
+                return 50
+            
+            # Calculate fantasy points for each game
+            game_scores = []
+            for _, game in recent_games.iterrows():
+                fp = self.calculate_dk_points({
+                    'points': game['PTS'],
+                    'rebounds': game['REB'],
+                    'assists': game['AST'],
+                    'steals': game['STL'],
+                    'blocks': game['BLK'],
+                    'turnovers': game['TOV']
+                })
+                game_scores.append(fp)
+            
+            # Calculate how often player meets baseline (75% of average)
+            avg_score = sum(game_scores) / len(game_scores)
+            baseline = avg_score * 0.75
+            meets_baseline = sum(1 for score in game_scores if score >= baseline)
+            consistency_pct = (meets_baseline / len(game_scores)) * 100
+            
+            return min(100, max(0, consistency_pct))
+            
+        except:
+            return 50
+
+    def calculate_enhanced_projection(self, player, recent_games, position, team, dk_salary_info):
+        """Calculate enhanced fantasy projection with reality checks and volatility adjustments"""
+        try:
+            # Calculate base averages from recent games with more conservative approach
+            avg_stats = self.calculate_robust_averages(recent_games)
             
             # Skip players with very low minutes
             if avg_stats['minutes'] < 10:
@@ -376,60 +612,99 @@ class EnhancedProjectionsNBAData:
             fantasy_points_per_minute = self.calculate_fantasy_points_per_minute(recent_games)
             plus_minus_rating = self.calculate_plus_minus_rating(recent_games, avg_stats['minutes'])
             
-            # Calculate projected minutes (with usage rate and plus/minus consideration)
-            projected_minutes = self.project_minutes(avg_stats['minutes'], recent_games, team, usage_rate, plus_minus_rating)
+            # Calculate player volatility and consistency
+            volatility_score = self.calculate_volatility_score(recent_games)
+            consistency_rating = self.calculate_consistency_rating(recent_games)
             
-            # Calculate per-minute rates
+            # Calculate home/away splits
+            home_away_splits = self.calculate_home_away_splits(recent_games)
+            
+            # Get today's matchup data
+            matchup_info = self.matchup_data.get(team, {})
+            location = matchup_info.get('location', 'home')
+            opponent = matchup_info.get('opponent', 'UNK')
+            matchup_difficulty = matchup_info.get('matchup_difficulty', 0)
+            opp_def_rating = matchup_info.get('opp_def_rating', 110.0)
+            
+            # Check for back-to-back
+            back_to_back = self.check_back_to_back(team)
+            
+            # Calculate projected minutes (more conservative with volatility consideration)
+            projected_minutes = self.project_minutes(
+                avg_stats['minutes'], recent_games, team, usage_rate, 
+                plus_minus_rating, location, back_to_back, matchup_difficulty,
+                volatility_score, consistency_rating
+            )
+            
+            # Apply reality check to minutes projection
+            projected_minutes = self.apply_minutes_reality_check(projected_minutes, player['full_name'], position, usage_rate)
+            
+            # Calculate per-minute rates with volatility adjustment
             per_36_stats = {}
-            for stat in ['points', 'rebounds', 'assists', 'steals', 'blocks', 'turnovers']:
-                if avg_stats['minutes'] > 0:
-                    per_36_stats[stat] = (avg_stats[stat] / avg_stats['minutes']) * 36
+            stat_columns = {
+                'points': 'PTS',
+                'rebounds': 'REB', 
+                'assists': 'AST',
+                'steals': 'STL',
+                'blocks': 'BLK',
+                'turnovers': 'TOV'
+            }
+
+            for stat, nba_col in stat_columns.items():
+                if nba_col in recent_games.columns and avg_stats['minutes'] > 0:
+                    # Use median instead of mean for more stable projections
+                    median_stat = recent_games[nba_col].median()
+                    per_36_stats[stat] = (median_stat / avg_stats['minutes']) * 36
                 else:
                     per_36_stats[stat] = 0
             
-            # Apply pace adjustment
+            # Apply various adjustments with volatility consideration
             pace_adjustment = self.get_pace_adjustment(team)
-            
-            # Apply usage-based adjustments to scoring stats
             usage_adjustment = self.get_usage_adjustment(usage_rate)
-            
-            # Apply plus/minus adjustment to all stats
             plus_minus_adjustment = self.get_plus_minus_adjustment(plus_minus_rating)
+            matchup_adjustment = self.get_matchup_adjustment(opp_def_rating, location)
+            home_away_adjustment = self.get_home_away_adjustment(location, home_away_splits)
+            back_to_back_adjustment = self.get_back_to_back_adjustment(back_to_back, usage_rate)
+            volatility_adjustment = self.get_volatility_adjustment(volatility_score, usage_rate)
             
-            # Calculate pace-adjusted, usage-adjusted, and plus/minus-adjusted per-36 stats
+            # Calculate adjusted per-36 stats
             pace_adjusted_stats = {}
-            scoring_stats = ['points', 'assists']  # Stats that benefit from higher usage
-            non_scoring_stats = ['rebounds', 'steals', 'blocks']  # Stats less affected by usage
+            scoring_stats = ['points', 'assists']
+            non_scoring_stats = ['rebounds', 'steals', 'blocks']
             
             for stat in scoring_stats:
-                pace_adjusted_stats[stat] = per_36_stats[stat] * pace_adjustment * usage_adjustment * plus_minus_adjustment
+                pace_adjusted_stats[stat] = per_36_stats[stat] * pace_adjustment * usage_adjustment * plus_minus_adjustment * matchup_adjustment * home_away_adjustment * back_to_back_adjustment * volatility_adjustment
             
             for stat in non_scoring_stats:
-                pace_adjusted_stats[stat] = per_36_stats[stat] * pace_adjustment * plus_minus_adjustment
+                pace_adjusted_stats[stat] = per_36_stats[stat] * pace_adjustment * plus_minus_adjustment * matchup_adjustment * home_away_adjustment * back_to_back_adjustment * volatility_adjustment
             
-            pace_adjusted_stats['turnovers'] = per_36_stats['turnovers'] * (1 + (usage_adjustment - 1) * 0.3)  # Slight increase in TOs with usage
+            pace_adjusted_stats['turnovers'] = per_36_stats['turnovers'] * (1 + (usage_adjustment - 1) * 0.3)
             
-            # Calculate final projection based on projected minutes
+            # Calculate final projection with additional safety factors
             final_stats = {}
             for stat in pace_adjusted_stats:
                 final_stats[stat] = (pace_adjusted_stats[stat] / 36) * projected_minutes
             
-            # Apply efficiency adjustment based on recent shooting
+            # Apply efficiency adjustment
             efficiency_adjustment = self.calculate_efficiency_adjustment(recent_games)
             final_stats['points'] *= efficiency_adjustment
             
             # Calculate DK points from final stats
             projection = self.calculate_dk_points(final_stats)
             
+            # Use ACTUAL DK salary
+            salary = dk_salary_info['salary']
+            
+            # Apply final reality checks and safety factors
+            projection = self.apply_projection_reality_checks(projection, player['full_name'], position, salary, usage_rate, consistency_rating, projected_minutes)
+            
             if projection < 5:
                 return None
             
-            # Use ACTUAL DK salary
-            salary = dk_salary_info['salary']
             value_rating = (projection / salary) * 1000
             
-            # Calculate bargain rating (0-100 scale)
-            bargain_rating = self.calculate_bargain_rating(projection, salary, usage_rate, plus_minus_rating, fantasy_points_per_minute)
+            # Calculate bargain rating with consistency consideration
+            bargain_rating = self.calculate_bargain_rating(projection, salary, usage_rate, plus_minus_rating, fantasy_points_per_minute, consistency_rating)
             
             return {
                 'name': player['full_name'],
@@ -448,6 +723,16 @@ class EnhancedProjectionsNBAData:
                 'efficiency_adjustment': round(efficiency_adjustment, 3),
                 'value_rating': round(value_rating, 2),
                 'bargain_rating': round(bargain_rating, 1),
+                'consistency_rating': round(consistency_rating, 1),
+                'volatility_score': round(volatility_score, 2),
+                'location': location,
+                'opponent': opponent,
+                'matchup_difficulty': round(matchup_difficulty, 2),
+                'back_to_back': back_to_back,
+                'home_away_adjustment': round(home_away_adjustment, 3),
+                'matchup_adjustment': round(matchup_adjustment, 3),
+                'back_to_back_adjustment': round(back_to_back_adjustment, 3),
+                'volatility_adjustment': round(volatility_adjustment, 3),
                 'games_used': len(recent_games),
                 'source': 'enhanced_projections',
                 'playing_today': True
@@ -549,6 +834,26 @@ class EnhancedProjectionsNBAData:
         except Exception as e:
             return 0.0
 
+    def calculate_home_away_splits(self, player_games):
+        """Calculate player performance splits for home vs away games"""
+        try:
+            home_games = player_games[player_games['MATCHUP'].str.contains('vs.', na=False)]
+            away_games = player_games[player_games['MATCHUP'].str.contains('@', na=False)]
+            
+            splits = {
+                'home_ppg': home_games['PTS'].mean() if len(home_games) > 0 else 0,
+                'away_ppg': away_games['PTS'].mean() if len(away_games) > 0 else 0,
+                'home_minutes': home_games['MIN'].mean() if len(home_games) > 0 else 0,
+                'away_minutes': away_games['MIN'].mean() if len(away_games) > 0 else 0,
+                'home_games': len(home_games),
+                'away_games': len(away_games)
+            }
+            
+            return splits
+            
+        except:
+            return {'home_ppg': 0, 'away_ppg': 0, 'home_minutes': 0, 'away_minutes': 0, 'home_games': 0, 'away_games': 0}
+
     def get_usage_adjustment(self, usage_rate):
         """Get adjustment factor based on usage rate"""
         # Higher usage players tend to maintain production better
@@ -567,44 +872,198 @@ class EnhancedProjectionsNBAData:
         # Reasonable bounds
         return max(0.7, min(1.3, adjustment))
 
-    def calculate_bargain_rating(self, projection, salary, usage_rate, plus_minus_rating, fantasy_points_per_minute):
-        """Calculate comprehensive bargain rating (0-100 scale)"""
+    def get_matchup_adjustment(self, opp_def_rating, location):
+        """Get adjustment factor based on opponent defense"""
+        # League average defense rating
+        league_avg_def = 110.0
+        
+        # Calculate adjustment (lower opponent defense = harder matchup)
+        # If opponent defense is better than average (lower rating), reduce projection
+        def_difference = league_avg_def - opp_def_rating
+        adjustment = 1.0 + (def_difference * 0.01)  # 1% change per defense point
+        
+        # Reasonable bounds
+        return max(0.8, min(1.2, adjustment))
+
+    def get_home_away_adjustment(self, location, home_away_splits):
+        """Get adjustment factor based on home/away location and player splits"""
+        try:
+            # Base home court advantage
+            if location == 'home':
+                base_adjustment = 1.02  # 2% boost at home
+            else:
+                base_adjustment = 0.98  # 2% reduction on road
+            
+            # Apply player-specific splits if we have enough data
+            if home_away_splits['home_games'] >= 3 and home_away_splits['away_games'] >= 3:
+                home_ppg = home_away_splits['home_ppg']
+                away_ppg = home_away_splits['away_ppg']
+                
+                if home_ppg > 0 and away_ppg > 0:
+                    split_ratio = home_ppg / away_ppg if location == 'home' else away_ppg / home_ppg
+                    # Blend base adjustment with player-specific split
+                    adjustment = (base_adjustment * 0.7) + (split_ratio * 0.3)
+                    return max(0.9, min(1.1, adjustment))
+            
+            return base_adjustment
+            
+        except:
+            return 1.0
+
+    def get_back_to_back_adjustment(self, back_to_back, usage_rate):
+        """Get adjustment factor for back-to-back games"""
+        if not back_to_back:
+            return 1.0
+        
+        # High usage players are more affected by back-to-backs
+        if usage_rate > 0.25:
+            return 0.95  # 5% reduction for high usage players
+        elif usage_rate > 0.18:
+            return 0.97  # 3% reduction for medium usage players
+        else:
+            return 0.99  # 1% reduction for low usage players
+
+    def get_volatility_adjustment(self, volatility_score, usage_rate):
+        """Adjust projection based on player volatility"""
+        # High volatility players get downward adjustment
+        # High usage players are less volatile typically
+        base_adjustment = 1.0
+        
+        if volatility_score > 1.2:  # High volatility
+            if usage_rate < 0.15:   # Low usage + high volatility = big reduction
+                base_adjustment = 0.85
+            else:                   # High usage + high volatility = moderate reduction
+                base_adjustment = 0.92
+        elif volatility_score > 0.8:  # Medium volatility
+            base_adjustment = 0.95
+        
+        return base_adjustment
+
+    def apply_minutes_reality_check(self, projected_minutes, player_name, position, usage_rate):
+        """Apply reality checks to minutes projections"""
+        # Cap minutes based on role and usage
+        max_minutes = 36
+        
+        if usage_rate < 0.15:  # Low usage role player
+            max_minutes = 28
+        elif usage_rate < 0.20:  # Medium usage
+            max_minutes = 32
+        elif usage_rate < 0.25:  # High usage
+            max_minutes = 36
+        else:  # Star player
+            max_minutes = 38
+        
+        # Additional position-based caps
+        if position == 'C':
+            max_minutes = min(max_minutes, 34)  # Centers often play fewer minutes
+        
+        return min(projected_minutes, max_minutes)
+
+    def apply_projection_reality_checks(self, projection, player_name, position, salary, usage_rate, consistency_rating, projected_minutes):
+        """Apply final reality checks to projections"""
+        # Cap projections based on salary and role
+        max_projection_by_salary = salary * 0.008  # $1,000 salary = 8x max projection
+        
+        if usage_rate < 0.15:  # Low usage role players
+            max_projection_by_salary *= 0.8  # 20% reduction
+        
+        # Apply consistency adjustment
+        consistency_adjustment = consistency_rating / 100
+        
+        # Apply minutes-based cap (assume 1.5 FPTS per minute maximum for non-stars)
+        if usage_rate < 0.20:
+            max_by_minutes = projected_minutes * 1.3
+            projection = min(projection, max_by_minutes)
+        
+        projection = min(projection, max_projection_by_salary)
+        projection *= consistency_adjustment
+        
+        return projection
+
+    def calculate_bargain_rating(self, projection, salary, usage_rate, plus_minus_rating, fantasy_points_per_minute, consistency_rating):
+        """Calculate comprehensive bargain rating with consistency consideration"""
         try:
             score = 0
             
-            # Base value score (40% of total)
+            # Base value score (30% of total)
             if salary > 0:
                 value_score = (projection / salary) * 1000
-                # Normalize value score (typical range 2-8, with 5 being good)
-                value_component = min(40, (value_score - 2) * (40 / 6))  # Scale to 0-40
+                value_component = min(30, (value_score - 2) * (30 / 6))
                 score += max(0, value_component)
             
             # Usage rate component (20% of total)
-            # Higher usage players are more reliable
-            usage_component = min(20, usage_rate * 100)  # Usage rate as percentage
+            usage_component = min(20, usage_rate * 100)
             score += usage_component
             
-            # Plus/minus component (20% of total)
-            # Positive impact players are more reliable
-            pm_component = min(20, (plus_minus_rating + 10) * (20 / 20))  # Convert -10 to +10 scale to 0-20
+            # Plus/minus component (15% of total)
+            pm_component = min(15, (plus_minus_rating + 10) * (15 / 20))
             score += max(0, pm_component)
             
-            # Efficiency component (20% of total)
-            # High fantasy points per minute indicates efficiency
-            # Typical range: 0.8-1.5 FPTS/min, with 1.1 being good
+            # Efficiency component (15% of total)
             if fantasy_points_per_minute > 0:
-                efficiency_component = min(20, (fantasy_points_per_minute - 0.8) * (20 / 0.7))
+                efficiency_component = min(15, (fantasy_points_per_minute - 0.8) * (15 / 0.7))
                 score += max(0, efficiency_component)
             
-            # Ensure score is within 0-100 range
+            # Consistency component (20% of total)
+            consistency_component = consistency_rating * 0.2
+            score += consistency_component
+            
             return min(100, max(0, score))
             
         except Exception as e:
-            # Fallback to simple value calculation
             if salary > 0:
                 simple_value = (projection / salary) * 1000
                 return min(100, (simple_value - 2) * (100 / 6))
             return 50
+
+    def project_minutes(self, recent_minutes, recent_games, team, usage_rate=None, plus_minus_rating=None, location='home', back_to_back=False, matchup_difficulty=0, volatility_score=1.0, consistency_rating=50):
+        """Project minutes for tonight's game with usage rate, plus/minus, matchup, and back-to-back consideration"""
+        # Base projection is recent average
+        base_minutes = recent_minutes
+        
+        # Adjust for trends (last 3 games vs full average)
+        if len(recent_games) >= 3:
+            last_3_minutes = recent_games.head(3)['MIN'].mean()
+            # If player's minutes are trending up, adjust slightly
+            if last_3_minutes > recent_minutes:
+                base_minutes = (recent_minutes + last_3_minutes) / 2
+        
+        # High usage players might see slightly reduced minutes in blowouts
+        # but are less likely to see random DNP-CDs
+        blowout_risk = 0.95  # Default slight reduction
+        
+        if usage_rate and usage_rate > 0.25:  # High usage players
+            blowout_risk = 0.98  # Less reduction for stars
+        elif usage_rate and usage_rate < 0.15:  # Low usage players
+            blowout_risk = 0.92  # More reduction for role players
+        
+        # Players with positive plus/minus are more likely to maintain minutes
+        if plus_minus_rating and plus_minus_rating > 2:
+            blowout_risk += 0.02  # Slight boost for positive impact players
+        elif plus_minus_rating and plus_minus_rating < -2:
+            blowout_risk -= 0.02  # Slight reduction for negative impact players
+        
+        # Back-to-back games might reduce minutes, especially for high usage players
+        if back_to_back:
+            if usage_rate and usage_rate > 0.25:
+                blowout_risk -= 0.03  # Extra reduction for stars on back-to-back
+            else:
+                blowout_risk -= 0.01  # Small reduction for role players
+        
+        # Tough matchups might reduce minutes for role players
+        if matchup_difficulty < -0.5:  # Hard matchup
+            if usage_rate and usage_rate < 0.18:
+                blowout_risk -= 0.02  # Extra reduction for role players in tough matchups
+        
+        # High volatility players might see more minute variability
+        if volatility_score > 1.2:
+            blowout_risk -= 0.02
+        
+        # Cap minutes at reasonable levels
+        projected_minutes = min(38, base_minutes * blowout_risk)
+        projected_minutes = max(10, projected_minutes)  # Minimum floor
+        
+        return projected_minutes
 
     def calculate_efficiency_adjustment(self, player_games):
         """Adjust projection based on recent shooting efficiency"""
@@ -632,39 +1091,6 @@ class EnhancedProjectionsNBAData:
                 return 1.0
         except:
             return 1.0
-
-    def project_minutes(self, recent_minutes, recent_games, team, usage_rate=None, plus_minus_rating=None):
-        """Project minutes for tonight's game with usage rate and plus/minus consideration"""
-        # Base projection is recent average
-        base_minutes = recent_minutes
-        
-        # Adjust for trends (last 3 games vs full average)
-        if len(recent_games) >= 3:
-            last_3_minutes = recent_games.head(3)['MIN'].mean()
-            # If player's minutes are trending up, adjust slightly
-            if last_3_minutes > recent_minutes:
-                base_minutes = (recent_minutes + last_3_minutes) / 2
-        
-        # High usage players might see slightly reduced minutes in blowouts
-        # but are less likely to see random DNP-CDs
-        blowout_risk = 0.95  # Default slight reduction
-        
-        if usage_rate and usage_rate > 0.25:  # High usage players
-            blowout_risk = 0.98  # Less reduction for stars
-        elif usage_rate and usage_rate < 0.15:  # Low usage players
-            blowout_risk = 0.92  # More reduction for role players
-        
-        # Players with positive plus/minus are more likely to maintain minutes
-        if plus_minus_rating and plus_minus_rating > 2:
-            blowout_risk += 0.02  # Slight boost for positive impact players
-        elif plus_minus_rating and plus_minus_rating < -2:
-            blowout_risk -= 0.02  # Slight reduction for negative impact players
-        
-        # Cap minutes at reasonable levels
-        projected_minutes = min(38, base_minutes * blowout_risk)
-        projected_minutes = max(10, projected_minutes)  # Minimum floor
-        
-        return projected_minutes
 
     def get_pace_adjustment(self, team):
         """Get pace adjustment factor for a team"""
@@ -842,16 +1268,27 @@ class EnhancedProjectionsNBAData:
             return
             
         print("\n📊 ENHANCED PROJECTIONS SUMMARY:")
-        print("-" * 60)
+        print("-" * 70)
         
         pos_count = {}
         team_count = {}
+        home_players = 0
+        away_players = 0
+        b2b_players = 0
         
         for player in self.players_data:
             pos = player['position']
             team = player['team']
             pos_count[pos] = pos_count.get(pos, 0) + 1
             team_count[team] = team_count.get(team, 0) + 1
+            
+            if player.get('location') == 'home':
+                home_players += 1
+            else:
+                away_players += 1
+                
+            if player.get('back_to_back'):
+                b2b_players += 1
         
         print("Position Distribution:")
         for pos in ['PG', 'SG', 'SF', 'PF', 'C']:
@@ -860,7 +1297,13 @@ class EnhancedProjectionsNBAData:
         
         print(f"\nTeams in Pool:")
         for team, count in sorted(team_count.items(), key=lambda x: x[1], reverse=True):
-            print(f"  {team}: {count} players")
+            b2b = " (B2B)" if self.check_back_to_back(team) else ""
+            print(f"  {team}: {count} players{b2b}")
+        
+        print(f"\n📍 Location Distribution:")
+        print(f"  Home: {home_players} players")
+        print(f"  Away: {away_players} players")
+        print(f"  Back-to-Back: {b2b_players} players")
         
         # Show projection metrics
         avg_proj_minutes = sum(p.get('projected_minutes', 0) for p in self.players_data) / len(self.players_data)
@@ -870,6 +1313,9 @@ class EnhancedProjectionsNBAData:
         avg_fppm = sum(p.get('fantasy_points_per_minute', 0) for p in self.players_data) / len(self.players_data)
         avg_plus_minus = sum(p.get('plus_minus_rating', 0) for p in self.players_data) / len(self.players_data)
         avg_bargain = sum(p.get('bargain_rating', 0) for p in self.players_data) / len(self.players_data)
+        avg_matchup_diff = sum(p.get('matchup_difficulty', 0) for p in self.players_data) / len(self.players_data)
+        avg_consistency = sum(p.get('consistency_rating', 0) for p in self.players_data) / len(self.players_data)
+        avg_volatility = sum(p.get('volatility_score', 0) for p in self.players_data) / len(self.players_data)
         
         print(f"\n📈 Advanced Metrics:")
         print(f"  Avg Projected Minutes: {avg_proj_minutes:.1f}")
@@ -879,6 +1325,9 @@ class EnhancedProjectionsNBAData:
         print(f"  Avg Fantasy Points/Min: {avg_fppm:.3f}")
         print(f"  Avg Plus/Minus Rating: {avg_plus_minus:.1f}")
         print(f"  Avg Bargain Rating: {avg_bargain:.1f}")
+        print(f"  Avg Matchup Difficulty: {avg_matchup_diff:.2f}")
+        print(f"  Avg Consistency Rating: {avg_consistency:.1f}")
+        print(f"  Avg Volatility Score: {avg_volatility:.2f}")
         
         # Show top players by various metrics
         if len(self.players_data) >= 5:
@@ -892,12 +1341,23 @@ class EnhancedProjectionsNBAData:
             
             print(f"\n💰 Top 5 by Bargain Rating:")
             for player in sorted(self.players_data, key=lambda x: x.get('bargain_rating', 0), reverse=True)[:5]:
-                print(f"  {player['name']}: {player.get('bargain_rating', 0):.1f} (${player['salary']:,})")
+                b2b_indicator = " (B2B)" if player.get('back_to_back') else ""
+                print(f"  {player['name']}: {player.get('bargain_rating', 0):.1f} (${player['salary']:,}){b2b_indicator}")
             
             print(f"\n📊 Top 5 by Plus/Minus Rating:")
             for player in sorted(self.players_data, key=lambda x: x.get('plus_minus_rating', 0), reverse=True)[:5]:
                 print(f"  {player['name']}: {player.get('plus_minus_rating', 0):.1f}")
+            
+            print(f"\n🎯 Easiest Matchups:")
+            for player in sorted(self.players_data, key=lambda x: x.get('matchup_difficulty', 0), reverse=True)[:5]:
+                loc_indicator = "H" if player.get('location') == 'home' else "A"
+                print(f"  {player['name']} ({loc_indicator} vs {player.get('opponent', 'UNK')}): {player.get('matchup_difficulty', 0):.2f}")
+            
+            print(f"\n💎 Most Consistent Players:")
+            for player in sorted(self.players_data, key=lambda x: x.get('consistency_rating', 0), reverse=True)[:5]:
+                print(f"  {player['name']}: {player.get('consistency_rating', 0):.1f}")
 
+# EnhancedProjectionsNBAOptimizer class remains the same as before
 class EnhancedProjectionsNBAOptimizer:
     def __init__(self, dk_salaries_path="DKSalaries.csv"):
         self.data = EnhancedProjectionsNBAData(dk_salaries_path)
@@ -905,7 +1365,7 @@ class EnhancedProjectionsNBAOptimizer:
     def build_lineups(self):
         """Build lineups using enhanced projections"""
         print("\n🚀 ENHANCED PROJECTIONS NBA DFS LINEUP BUILDER")
-        print("Using minutes projections, pace adjustments, usage rate, plus/minus, and bargain ratings")
+        print("Using minutes projections, pace adjustments, usage rate, plus/minus, bargain ratings, matchup data, home/away splits, and consistency metrics")
         print("=" * 60)
         
         if not self.data.get_real_nba_data():
@@ -998,11 +1458,11 @@ class EnhancedProjectionsNBAOptimizer:
 
     def display_lineup(self, lineup):
         """Display the optimized lineup with enhanced metrics"""
-        print("\n" + "=" * 100)
+        print("\n" + "=" * 120)
         print("🏆 ENHANCED PROJECTIONS NBA DFS LINEUP")
-        print("=" * 100)
-        print("📈 Using minutes projections, pace adjustments, usage rate, plus/minus, and bargain ratings")
-        print("=" * 100)
+        print("=" * 120)
+        print("📈 Using minutes projections, pace adjustments, usage rate, plus/minus, bargain ratings, matchup data, home/away splits, and consistency metrics")
+        print("=" * 120)
         
         for i, player in enumerate(lineup['players'], 1):
             value_score = (player['projection'] / player['salary']) * 1000
@@ -1010,6 +1470,10 @@ class EnhancedProjectionsNBAOptimizer:
             usage_indicator = "🔥" if player.get('usage_rate', 0) > 0.25 else "📊" if player.get('usage_rate', 0) > 0.18 else "💧"
             pm_indicator = "🔼" if player.get('plus_minus_rating', 0) > 2 else "🔽" if player.get('plus_minus_rating', 0) < -2 else "➡️"
             bargain_indicator = "💎" if player.get('bargain_rating', 0) > 80 else "💰" if player.get('bargain_rating', 0) > 60 else "💵"
+            location_indicator = "🏠" if player.get('location') == 'home' else "✈️"
+            b2b_indicator = "🔄" if player.get('back_to_back') else ""
+            matchup_indicator = "🎯" if player.get('matchup_difficulty', 0) > 0.5 else "🛡️" if player.get('matchup_difficulty', 0) < -0.5 else "⚖️"
+            consistency_indicator = "📈" if player.get('consistency_rating', 0) > 80 else "📊" if player.get('consistency_rating', 0) > 60 else "📉"
             
             print(f"{i:2d}. {player['position']:2} | {player['name']:20} | "
                   f"${player['salary']:5,} | {player['projection']:5.1f} pts | "
@@ -1018,9 +1482,11 @@ class EnhancedProjectionsNBAOptimizer:
                   f"USG: {player.get('usage_rate', 0):.2f} {usage_indicator} | "
                   f"PM: {player.get('plus_minus_rating', 0):+.1f} {pm_indicator} | "
                   f"BR: {player.get('bargain_rating', 0):2.0f} {bargain_indicator} | "
-                  f"{pace_indicator} | {player['team']:3}")
+                  f"CON: {player.get('consistency_rating', 0):2.0f} {consistency_indicator} | "
+                  f"{location_indicator}{b2b_indicator} vs {player.get('opponent', 'UNK'):3} {matchup_indicator} | "
+                  f"{pace_indicator}")
     
-        print("=" * 100)
+        print("=" * 120)
         print(f"💵 Total Salary: ${lineup['total_salary']:,} / $50,000")
         print(f"📈 Total Projection: {lineup['total_projection']:.1f} fantasy points")
         print(f"⚡ Efficiency: {lineup['efficiency']:.2f} points per $1,000")
@@ -1033,6 +1499,10 @@ class EnhancedProjectionsNBAOptimizer:
         avg_fppm = sum(p.get('fantasy_points_per_minute', 0) for p in lineup['players']) / len(lineup['players'])
         avg_plus_minus = sum(p.get('plus_minus_rating', 0) for p in lineup['players']) / len(lineup['players'])
         avg_bargain = sum(p.get('bargain_rating', 0) for p in lineup['players']) / len(lineup['players'])
+        avg_matchup = sum(p.get('matchup_difficulty', 0) for p in lineup['players']) / len(lineup['players'])
+        avg_consistency = sum(p.get('consistency_rating', 0) for p in lineup['players']) / len(lineup['players'])
+        b2b_count = sum(1 for p in lineup['players'] if p.get('back_to_back'))
+        home_count = sum(1 for p in lineup['players'] if p.get('location') == 'home')
         
         print(f"📊 Enhanced Metrics:")
         print(f"  Avg Projected Minutes: {avg_proj_minutes:.1f}")
@@ -1042,14 +1512,18 @@ class EnhancedProjectionsNBAOptimizer:
         print(f"  Avg FPTS/Min: {avg_fppm:.3f}")
         print(f"  Avg Plus/Minus: {avg_plus_minus:+.1f}")
         print(f"  Avg Bargain Rating: {avg_bargain:.1f}")
+        print(f"  Avg Matchup Difficulty: {avg_matchup:.2f}")
+        print(f"  Avg Consistency Rating: {avg_consistency:.1f}")
+        print(f"  Home Players: {home_count}/{len(lineup['players'])}")
+        print(f"  Back-to-Back Players: {b2b_count}/{len(lineup['players'])}")
         
         lineup_teams = set(p['team'] for p in lineup['players'])
         print(f"🏀 Teams: {', '.join(sorted(lineup_teams))}")
-        print("=" * 100)
+        print("=" * 120)
 
 if __name__ == "__main__":
     print("🎯 ENHANCED PROJECTIONS NBA DFS LINEUP BUILDER")
-    print("With minutes projections, pace adjustments, usage rate, plus/minus, and bargain ratings")
+    print("With minutes projections, pace adjustments, usage rate, plus/minus, bargain ratings, matchup data, home/away splits, and consistency metrics")
     print()
     
     dk_file = "DKSalaries.csv"
@@ -1059,7 +1533,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     try:
-        from nba_api.stats.endpoints import commonplayerinfo, scoreboardv2, leaguedashteamstats
+        from nba_api.stats.endpoints import commonplayerinfo, scoreboardv2, leaguedashteamstats, teamgamelogs
         print("✅ nba_api is installed and working")
         print(f"✅ Found {dk_file}")
     except ImportError:
