@@ -8,6 +8,12 @@ import sys
 import os
 import time
 import numpy as np
+import pickle
+import hashlib
+from datetime import datetime
+import concurrent.futures
+import threading
+from threading import Lock
 
 class EnhancedProjectionsNBAData:
     #def __init__(self, dk_salaries_path="DKSalaries.csv"):
@@ -25,17 +31,299 @@ class EnhancedProjectionsNBAData:
         self.injury_report = {}
         self.team_spreads = {}
         self.target_date = target_date  # NEW: Allow custom date
+        self.player_info_cache = {}
+        self.cache_file = "player_cache.pkl"
+        self.load_player_cache()
         self.setup_team_map()
+        self.processing_lock = Lock()
+
+    def make_api_call_with_retry(self, api_call_func, max_retries=3, initial_delay=1):
+        """Make API call with retry logic and exponential backoff"""
+        for attempt in range(max_retries):
+            try:
+                return api_call_func()
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    raise e
+                delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                print(f"   ⚠️ API call failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
+                time.sleep(delay)
+        return None
+
+    def filter_to_dk_slate_games(self):
+        """Filter to only include games that are in the DraftKings slate"""
+        if self.dk_salaries_df is None:
+            print("❌ No DK salaries loaded")
+            return False
+
+        # Get unique teams from DK salaries
+        dk_teams = set()
+        team_col = None
+
+        # Find the team column in DK file
+        for col in ['TeamAbbrev', 'Team', 'teamAbbrev', 'TEAM_ABBREVIATION']:
+            if col in self.dk_salaries_df.columns:
+                team_col = col
+                break
+            
+        if not team_col:
+            print("❌ Could not find team column in DK salaries")
+            return False
+
+        # Get all unique teams from DK salaries
+        dk_teams = set(self.dk_salaries_df[team_col].dropna().unique())
+        print(f"📋 DK Slate Teams ({len(dk_teams)}): {', '.join(sorted(dk_teams))}")
+
+        # Filter todays_games to only include teams in DK slate
+        original_games = self.todays_games.copy()
+        self.todays_games = [team for team in self.todays_games if team in dk_teams]
+
+        removed_teams = set(original_games) - set(self.todays_games)
+        if removed_teams:
+            print(f"🚫 Removed {len(removed_teams)} teams not in DK slate: {', '.join(sorted(removed_teams))}")
+
+        print(f"✅ Final {len(self.todays_games)} teams for optimization: {', '.join(sorted(self.todays_games))}")
+
+        # Also verify we have enough players
+        dk_player_count = len(self.dk_salaries_df)
+        print(f"📊 DK Slate has {dk_player_count} players")
+
+        return True
+    
+    def get_all_players_with_correct_teams_parallel(self):
+        """Get ALL active players with their CORRECT current teams - SLOWER BUT RELIABLE VERSION"""
+        print("   🔍 Getting all players with correct teams (reliable parallel)...")
+        
+        all_active_players = [p for p in players.get_players() if p['is_active']]
+        players_with_teams = []
+        
+        # First, check cache for as many players as possible
+        cached_players = []
+        uncached_players = []
+        
+        for player in all_active_players:
+            cache_key = f"{player['id']}_{player['full_name']}"
+            if cache_key in self.player_info_cache:
+                cached_data, cache_time = self.player_info_cache[cache_key]
+                if (datetime.now() - cache_time).days < 3:  # 3-day cache
+                    team = cached_data['TEAM_ABBREVIATION'].iloc[0] if 'TEAM_ABBREVIATION' in cached_data.columns else None
+                    if team and team != '':
+                        player['team'] = team
+                        cached_players.append(player)
+                        continue
+            uncached_players.append(player)
+        
+        print(f"   📊 Cache hit: {len(cached_players)} players, Miss: {len(uncached_players)} players")
+        
+        # Only process uncached players in parallel with SLOWER processing
+        def process_player_batch(batch):
+            batch_results = []
+            for player in batch:
+                try:
+                    player_info = self.get_cached_player_info(player['id'], player['full_name'])
+                    if player_info is not None and 'TEAM_ABBREVIATION' in player_info.columns:
+                        team = player_info['TEAM_ABBREVIATION'].iloc[0]
+                        if team and team != '':
+                            player['team'] = team
+                            batch_results.append(player)
+                except Exception as e:
+                    continue
+            return batch_results
+        
+        # Process uncached players in parallel with MUCH smaller batches and delays
+        if uncached_players:
+            batch_size = 5  # Even smaller batches
+            batches = [uncached_players[i:i + batch_size] for i in range(0, len(uncached_players), batch_size)]
+            
+            print(f"   🔄 Processing {len(batches)} batches of {batch_size} players each...")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:  # Only 2 workers!
+                for i, batch in enumerate(batches):
+                    print(f"      Batch {i+1}/{len(batches)}...")
+                    batch_result = process_player_batch(batch)
+                    players_with_teams.extend(batch_result)
+                    
+                    # Add delay between batches
+                    if i < len(batches) - 1:  # Don't delay after last batch
+                        time.sleep(3)  # 3 second delay between batches
+        
+        # Add cached players to results
+        players_with_teams.extend(cached_players)
+        
+        # Save cache at the end
+        self.save_player_cache()
+        
+        print(f"   ✅ Found {len(players_with_teams)} players with team information")
+        return players_with_teams
+    # def get_all_players_with_correct_teams_parallel(self):
+    #     """Get ALL active players with their CORRECT current teams - PARALLEL VERSION"""
+    #     print("   🔍 Getting all players with correct teams (parallel)...")
+
+    #     all_active_players = [p for p in players.get_players() if p['is_active']]
+    #     players_with_teams = []
+
+    #     # First, check cache for as many players as possible
+    #     cached_players = []
+    #     uncached_players = []
+
+    #     for player in all_active_players:
+    #         cache_key = f"{player['id']}_{player['full_name']}"
+    #         if cache_key in self.player_info_cache:
+    #             cached_data, cache_time = self.player_info_cache[cache_key]
+    #             if (datetime.now() - cache_time).days < 7:  # 7-day cache
+    #                 team = cached_data['TEAM_ABBREVIATION'].iloc[0] if 'TEAM_ABBREVIATION' in cached_data.columns else None
+    #                 if team and team != '':
+    #                     player['team'] = team
+    #                     cached_players.append(player)
+    #                     continue
+    #         uncached_players.append(player)
+
+    #     print(f"   📊 Cache hit: {len(cached_players)} players, Miss: {len(uncached_players)} players")
+
+    #     # Only process uncached players in parallel
+    #     def process_player_batch(batch):
+    #         batch_results = []
+    #         for player in batch:
+    #             try:
+    #                 player_info = self.get_cached_player_info(player['id'], player['full_name'])
+    #                 if player_info is not None and 'TEAM_ABBREVIATION' in player_info.columns:
+    #                     team = player_info['TEAM_ABBREVIATION'].iloc[0]
+    #                     if team and team != '':
+    #                         player['team'] = team
+    #                         batch_results.append(player)
+    #             except Exception as e:
+    #                 continue
+    #         return batch_results
+
+    #     # Process uncached players in parallel with smaller batches
+    #     if uncached_players:
+    #         batch_size = 10  # Smaller batches to avoid rate limiting
+    #         batches = [uncached_players[i:i + batch_size] for i in range(0, len(uncached_players), batch_size)]
+
+    #         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:  # Reduced workers
+    #             results = list(executor.map(process_player_batch, batches))
+    #             for batch_result in results:
+    #                 players_with_teams.extend(batch_result)
+    #             # Add delay between batches to avoid rate limiting
+    #             time.sleep(1)
+
+    #     # Add cached players to results
+    #     players_with_teams.extend(cached_players)
+
+    #     # Save cache at the end
+    #     self.save_player_cache()
+
+    #     print(f"   ✅ Found {len(players_with_teams)} players with team information")
+    #     return players_with_teams
+
+    def load_player_cache(self):
+        """Load cached player info to avoid API calls"""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'rb') as f:
+                    self.player_info_cache = pickle.load(f)
+                print(f"✅ Loaded {len(self.player_info_cache)} cached players")
+
+                # Clean old cache entries (older than 30 days)
+                original_size = len(self.player_info_cache)
+                current_time = datetime.now()
+                self.player_info_cache = {k: v for k, v in self.player_info_cache.items() 
+                                        if (current_time - v[1]).days < 30}
+                if len(self.player_info_cache) < original_size:
+                    print(f"🧹 Cleaned {original_size - len(self.player_info_cache)} expired cache entries")
+        except Exception as e:
+            print(f"⚠️ Could not load cache: {e}")
+            self.player_info_cache = {}
+
+    def save_player_cache(self):
+        """Save player cache to file"""
+        try:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(self.player_info_cache, f)
+            print(f"💾 Saved {len(self.player_info_cache)} players to cache")
+        except Exception as e:
+            print(f"⚠️ Could not save cache: {e}")
+
+    def get_cached_player_info(self, player_id, player_name):
+        """Get player info from cache or API with retry logic"""
+        cache_key = f"{player_id}_{player_name}"
+
+        # Check if we have recent cache (within 3 days for faster updates)
+        if cache_key in self.player_info_cache:
+            cached_data, cache_time = self.player_info_cache[cache_key]
+            if (datetime.now() - cache_time).days < 3:  # Reduced from 7 to 3 days
+                return cached_data
+
+        # If not in cache or expired, get from API with retry
+        def fetch_player_info():
+            try:
+                player_info = commonplayerinfo.CommonPlayerInfo(player_id=player_id, timeout=60)  # Increased timeout
+                info_df = player_info.get_data_frames()[0]
+                return info_df
+            except Exception as e:
+                print(f"      API Error for {player_name}: {e}")
+                raise e
+
+        try:
+            info_df = self.make_api_call_with_retry(fetch_player_info, max_retries=2, initial_delay=2)
+
+            if info_df is not None and not info_df.empty:
+                # Cache the result
+                self.player_info_cache[cache_key] = (info_df, datetime.now())
+                return info_df
+            else:
+                print(f"      ❌ Failed to get player info for {player_name} after retries")
+                return None
+
+        except Exception as e:
+            print(f"      ❌ Final failure for {player_name}: {e}")
+            return None
+    
+    # def get_cached_player_info(self, player_id, player_name):
+    #     """Get player info from cache or API"""
+    #     cache_key = f"{player_id}_{player_name}"
+        
+    #     # Check if we have recent cache (within 7 days)
+    #     if cache_key in self.player_info_cache:
+    #         cached_data, cache_time = self.player_info_cache[cache_key]
+    #         if (datetime.now() - cache_time).days < 7:
+    #             return cached_data
+        
+    #     # If not in cache or expired, get from API
+    #     try:
+    #         player_info = commonplayerinfo.CommonPlayerInfo(player_id=player_id)
+    #         info_df = player_info.get_data_frames()[0]
+            
+    #         if not info_df.empty:
+    #             # Cache the result
+    #             self.player_info_cache[cache_key] = (info_df, datetime.now())
+    #             return info_df
+    #     except Exception as e:
+    #         print(f"      Error getting player info for {player_name}: {e}")
+        
+    #     return None
 
     def check_player_availability(self, player_name, team):
         """Check if player is expected to play - CRITICAL FIX"""
         # Known injured players (update this daily based on injury reports)
         injured_players = {
-            'Steven Adams': 'OUT',
-            'Zion Williamson': 'GTD', 
+            'Steven Adams': 'GTD',
+            'Zion Williamson': 'OUT', 
             'Ja Morant': 'OUT',
             'Kawhi Leonard': 'GTD',
             'Paul George': 'GTD',
+            'Lonzo Ball': 'OUT',
+            'Trae Young': 'OUT',
+            'Dean Wade': 'OUT',
+            'Dante Exum': 'OUT',
+            'Anthony Davis': 'OUT',
+            'Marcus Sasser': 'OUT',
+            'Dorian Finney-Smith': 'OUT',
+            'Jordan Poole': 'OUT',
+            'Walker Kessler': 'OUT',
+            'Jalen Suggs': 'OUT',
+            'Matisse Thybulle': 'OUT',
+            'Blake Wesley': 'OUT',
             # Add more based on daily injury reports
         }
 
@@ -46,12 +334,58 @@ class EnhancedProjectionsNBAData:
             'Kevin Durant': 'GTD'
         }
 
+         # Check exact match first
         if player_name in injured_players:
-            return injured_players[player_name]
+            print(f"      🚫 {player_name} is OUT (injured)")
+            return 'OUT'
         elif player_name in rest_players:
-            return rest_players[player_name]
+            print(f"      ⚠️ {player_name} is GTD (rest)")
+            return 'GTD'
+
+        # Check partial matches (in case of name variations)
+        for injured_player, status in injured_players.items():
+            if injured_player.lower() in player_name.lower():
+                print(f"      🚫 {player_name} is OUT (partial match: {injured_player})")
+                return 'OUT'
+
+        for rest_player, status in rest_players.items():
+            if rest_player.lower() in player_name.lower():
+                print(f"      ⚠️ {player_name} is GTD (partial match: {rest_player})")
+                return 'GTD'
 
         return 'PROBABLE'
+
+        # if player_name in injured_players:
+        #     return injured_players[player_name]
+        # elif player_name in rest_players:
+        #     return rest_players[player_name]
+
+        # return 'PROBABLE'
+    
+    def filter_available_players(self, players_data):
+        """Filter out injured players from the dataset"""
+        available_players = []
+        injured_count = 0
+        gtd_count = 0
+
+        for player in players_data:
+            status = self.check_player_availability(player['name'], player['team'])
+            if status == 'OUT':
+                injured_count += 1
+                continue
+            elif status == 'GTD':
+                gtd_count += 1
+                # Include GTD players but mark them
+                player['injury_status'] = 'GTD'
+            else:
+                player['injury_status'] = 'PROBABLE'
+
+            available_players.append(player)
+
+        if injured_count > 0 or gtd_count > 0:
+            print(f"   ⚠️ Injury Report: {injured_count} OUT, {gtd_count} GTD")
+
+        return available_players
         
     def setup_team_map(self):
         """Create mapping from team IDs to abbreviations"""
@@ -66,6 +400,88 @@ class EnhancedProjectionsNBAData:
         # For now, we'll create a placeholder structure
         self.injury_report = {}
         # In practice, you'd populate this from an injury API or news source
+
+    def get_player_recent_games(self, player_name):
+        """Get recent games for a player - helper method for other functions"""
+        try:
+            # Try to find player ID first
+            player_id = None
+            for player in self.players.get_players():
+                if player['full_name'].lower() == player_name.lower():
+                    player_id = player['id']
+                    break
+            
+            if not player_id:
+                return None
+                
+            # Use cached game logs if available
+            if player_id in self.player_game_logs_cache:
+                return self.player_game_logs_cache[player_id]
+                
+            # Get recent game logs (last 30 days)
+            end_date = self.target_date if self.target_date else datetime.now()
+            start_date = end_date - timedelta(days=30)
+            
+            date_from = start_date.strftime('%Y-%m-%d')
+            date_to = end_date.strftime('%Y-%m-%d')
+            
+            game_logs = playergamelogs.PlayerGameLogs(
+                player_id_nullable=player_id,
+                season_nullable=self.get_current_season(),
+                date_from_nullable=date_from,
+                date_to_nullable=date_to
+            )
+            logs_df = game_logs.get_data_frames()[0]
+            
+            # Cache the results
+            self.player_game_logs_cache[player_id] = logs_df
+            return logs_df
+            
+        except Exception as e:
+            return None
+
+    def get_recent_minutes(self, player_name):
+        """Get recent actual minutes for a player from game logs"""
+        try:
+            player_games = self.get_player_recent_games(player_name)
+            if player_games is not None and len(player_games) > 0:
+                recent_minutes = []
+                for _, game in player_games.head(10).iterrows():  # Last 10 games
+                    if 'MIN' in game and game['MIN'] > 0:
+                        # Convert minutes string "35:12" to float 35.2
+                        minutes_str = str(game['MIN'])
+                        if ':' in minutes_str:
+                            parts = minutes_str.split(':')
+                            minutes_float = float(parts[0]) + float(parts[1]) / 60.0
+                        else:
+                            minutes_float = float(minutes_str)
+                        recent_minutes.append(minutes_float)
+                return recent_minutes if recent_minutes else None
+        except Exception as e:
+            print(f"      ⚠️ Error getting minutes for {player_name}: {e}")
+        return None
+
+    def get_recent_fantasy_production(self, player_name):
+        """Get recent fantasy point production for a player"""
+        try:
+            player_games = self.get_player_recent_games(player_name)
+            if player_games is not None and len(player_games) > 0:
+                recent_fp = []
+                for _, game in player_games.head(10).iterrows():  # Last 10 games
+                    fp = self.calculate_dk_points({
+                        'points': game.get('PTS', 0),
+                        'rebounds': game.get('REB', 0),
+                        'assists': game.get('AST', 0),
+                        'steals': game.get('STL', 0),
+                        'blocks': game.get('BLK', 0),
+                        'turnovers': game.get('TOV', 0),
+                        'three_pointers_made': game.get('FG3M', 0)
+                    })
+                    recent_fp.append(fp)
+                return recent_fp if recent_fp else None
+        except Exception as e:
+            print(f"      ⚠️ Error getting fantasy production for {player_name}: {e}")
+        return None
         
     def calculate_blowout_risk(self, team, opponent):
         """Calculate blowout risk based on team strength and spreads"""
@@ -428,34 +844,52 @@ class EnhancedProjectionsNBAData:
         except Exception as e:
             print(f"❌ Error getting schedule: {e}")
             return False
-
+        
     def get_real_nba_data(self):
         """Get real NBA data with enhanced projections"""
         print("📊 Getting REAL NBA data with ENHANCED PROJECTIONS v2...")
         print("=" * 50)
-        
+
         if not self.load_dk_salaries():
             return False
-        
+
         if not self.get_todays_games():
             return False
-        
+
+        # NEW: FILTER TO DK SLATE ONLY
+        print("\n🎯 Filtering to DraftKings slate games...")
+        if not self.filter_to_dk_slate_games():
+            print("⚠️  Using all games (DK filter failed)")
+
+        # Check if we have enough games after filtering
+        if len(self.todays_games) < 2:
+            print("❌ Not enough games in DK slate after filtering")
+            return False
+
         # Get team stats and pace data
         if not self.get_team_stats_and_pace():
             print("⚠️  Continuing without team pace data")
-        
+
         # Get team schedule for back-to-back checking
         self.get_team_game_schedule()
-        
-        # NEW: Load injury data
+
+        # Load injury data
         self.load_injury_data()
-        
+
         try:
             season = self.get_current_season()
             print(f"📅 Current season: {season}")
-            
+
             self.players_data = self.get_enhanced_player_projections(season)
-            
+
+            # Filter out injured players
+            if self.players_data:
+                print(f"🩹 Filtering out injured players...")
+                original_count = len(self.players_data)
+                self.players_data = self.filter_available_players(self.players_data)
+                filtered_count = len(self.players_data)
+                print(f"✅ Available players: {filtered_count}/{original_count}")
+
             if self.players_data:
                 print(f"✅ Successfully loaded {len(self.players_data)} players with ENHANCED projections v2")
                 # Identify high upside players
@@ -465,11 +899,64 @@ class EnhancedProjectionsNBAData:
             else:
                 print("❌ No player data retrieved")
                 return False
-                
+
         except Exception as e:
             print(f"💥 Error getting NBA data: {e}")
             import traceback
             traceback.print_exc()
+            return False
+
+    def get_real_nba_data_faster(self):
+        """Faster version of data retrieval"""
+        print("📊 Getting REAL NBA data with ENHANCED PROJECTIONS v2 (FAST)...")
+        print("=" * 50)
+
+        if not self.load_dk_salaries():
+            return False
+
+        if not self.get_todays_games():
+            return False
+
+        # EARLY EXIT: If very few games, reduce processing
+        if len(self.todays_games) <= 2:
+            print("⚠️  Small slate detected - using optimized processing")
+            # Use simpler methods for small slates
+
+        # Get team stats and pace data in background
+        print("   Getting team stats (non-blocking)...")
+        stats_thread = threading.Thread(target=self.get_team_stats_and_pace)
+        stats_thread.start()
+
+        # Get team schedule for back-to-back checking
+        self.get_team_game_schedule()
+
+        # Load injury data
+        self.load_injury_data()
+
+        try:
+                season = self.get_current_season()
+                print(f"📅 Current season: {season}")
+
+                # Try the main method first
+                print("   Attempting main player data collection...")
+                self.players_data = self.get_enhanced_player_projections_faster(season)
+
+                # If that fails, try fallback
+                if not self.players_data or len(self.players_data) < 20:
+                    print("   ⚠️ Main method failed, trying fallback...")
+                    # You might need to implement a fallback projection method
+
+                if self.players_data:
+                    print(f"✅ Successfully loaded {len(self.players_data)} players")
+                    self.identify_high_upside_players()
+                    self.show_data_summary_enhanced()
+                    return True
+                else:
+                    print("❌ No player data retrieved")
+                    return False
+
+        except Exception as e:
+            print(f"💥 Error getting NBA data: {e}")
             return False
 
     def get_current_season(self):
@@ -532,6 +1019,147 @@ class EnhancedProjectionsNBAData:
             for col in ['PLAYER_ID', 'PLAYER_NAME', 'MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'FG3M']:
                 if col in sample_row.index:
                     print(f"   {col}: {sample_row[col]}")
+
+    def get_enhanced_player_projections_faster(self, season):
+        """MUCH FASTER version of player projections - FIXED"""
+        print("🔄 Getting enhanced player projections (OPTIMIZED)...")
+
+        player_data = []
+
+        # Get all players with teams (uses cache)
+        print("   Step 1: Getting players with teams...")
+        all_players_with_teams = self.get_all_players_with_correct_teams_parallel()
+
+        if not all_players_with_teams:
+            print("❌ No players with teams found")
+            return []
+
+        # Filter to today's players (DK slate only)
+        todays_players = [p for p in all_players_with_teams if p.get('team') in self.todays_games]
+        print(f"   🎯 Found {len(todays_players)} players on today's DK slate teams")
+
+        if len(todays_players) == 0:
+            print("❌ No players found for today's DK slate games")
+            return []
+
+        # Get game logs - FIXED: Don't filter by player_id in the API call (it's causing issues)
+        print("   Step 2: Getting game logs (optimized batch)...")
+        try:
+            # Use date range to limit data but DON'T filter by player_id in the API call
+            end_date = self.target_date if self.target_date else datetime.now()
+            start_date = end_date - timedelta(days=30)  # 30 days of data
+
+            date_from = start_date.strftime('%Y-%m-%d')
+            date_to = end_date.strftime('%Y-%m-%d')
+
+            print(f"   📅 Getting logs from {date_from} to {date_to}")
+
+            # Single API call for recent games (without player_id filter)
+            all_game_logs = playergamelogs.PlayerGameLogs(
+                season_nullable=season,
+                date_from_nullable=date_from,
+                date_to_nullable=date_to
+                # REMOVED: player_id_nullable=today_player_ids - this was causing the issue
+            )
+            all_logs_df = all_game_logs.get_data_frames()[0]
+            print(f"   📈 Loaded {len(all_logs_df)} total game logs")
+
+            if all_logs_df.empty:
+                print("❌ No game logs found")
+                return []
+
+        except Exception as e:
+            print(f"❌ Error loading game logs: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+        # Get player IDs for today's players for filtering
+        today_player_ids = [p['id'] for p in todays_players]
+
+        # Filter the DataFrame locally (much more reliable)
+        filtered_logs = all_logs_df[all_logs_df['PLAYER_ID'].isin(today_player_ids)]
+        print(f"   🔍 Filtered to {len(filtered_logs)} logs for today's players")
+
+        # Group logs by player for faster lookup
+        player_logs_dict = {}
+        for player_id in today_player_ids:
+            player_logs = filtered_logs[filtered_logs['PLAYER_ID'] == player_id]
+            if not player_logs.empty:
+                # Sort by date and take most recent 10 games
+                player_logs = player_logs.sort_values('GAME_DATE', ascending=False).head(10)
+                player_logs_dict[player_id] = player_logs
+
+        print(f"   📊 Found logs for {len(player_logs_dict)} relevant players")
+
+        # Process players
+        print("   Step 3: Calculating projections...")
+        processed_count = 0
+        skipped_no_logs = 0
+        skipped_low_minutes = 0
+        skipped_no_salary = 0
+
+        for player in todays_players:
+            try:
+                player_id = player['id']
+                player_name = player['full_name']
+                team = player['team']
+
+                # Skip if no logs available
+                if player_id not in player_logs_dict:
+                    skipped_no_logs += 1
+                    continue
+
+                player_logs = player_logs_dict[player_id]
+                recent_games = player_logs.head(10)
+
+                if len(recent_games) < 3:
+                    skipped_no_logs += 1
+                    continue
+
+                # Quick health checks
+                required_columns = ['MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'FG3M']
+                missing_columns = [col for col in required_columns if col not in recent_games.columns]
+                if missing_columns:
+                    continue
+
+                # Skip players with very low minutes
+                recent_minutes = recent_games['MIN'].mean()
+                if recent_minutes < 8:
+                    skipped_low_minutes += 1
+                    continue
+
+                # Find DK salary
+                dk_salary_info = self.find_player_in_dk_salaries(player_name, team)
+                if not dk_salary_info:
+                    skipped_no_salary += 1
+                    continue
+
+                # Get position
+                position = dk_salary_info.get('position')
+                if not position:
+                    position = self.get_player_position(player_id, player_name)
+
+                # Calculate projection
+                projection_data = self.calculate_enhanced_projection(
+                    player, recent_games, position, team, dk_salary_info
+                )
+
+                if projection_data:
+                    player_data.append(projection_data)
+                    processed_count += 1
+
+                    if processed_count % 10 == 0:
+                        print(f"      Processed {processed_count}/{len(todays_players)} players...")
+
+            except Exception as e:
+                continue
+        # NEW: Apply automatic filters
+        player_data = self.apply_automatic_player_filters(player_data)
+
+        print(f"   ✅ Processed {processed_count} players with enhanced projections")
+        print(f"   📊 Skipped: {skipped_no_logs} no logs, {skipped_low_minutes} low minutes, {skipped_no_salary} no salary")
+        return player_data
 
     def get_enhanced_player_projections(self, season):
         """Get player stats with enhanced projections including minutes and pace"""
@@ -996,12 +1624,34 @@ class EnhancedProjectionsNBAData:
         projected_minutes = max(8, projected_minutes)  # Slightly lower minimum floor
         
         return projected_minutes
-
+    
     def apply_minutes_reality_check_enhanced(self, projected_minutes, player_name, position, usage_rate, role_stability):
-        """Enhanced minutes reality check with role stability"""
-        # Base caps on minutes based on role and usage
+        """Enhanced minutes reality check - MORE AGGRESSIVE"""
+        # Get recent actual minutes data to inform our caps
+        recent_actual_minutes = self.get_recent_minutes(player_name)
+
+        # If we have recent data, use it to cap projections
+        if recent_actual_minutes and len(recent_actual_minutes) >= 3:
+            avg_recent_minutes = sum(recent_actual_minutes) / len(recent_actual_minutes)
+            max_recent_minutes = max(recent_actual_minutes)
+
+            # CRITICAL: If player hasn't played meaningful minutes recently, cap aggressively
+            if avg_recent_minutes < 5:
+                # Player is emergency/deep bench - cap VERY low
+                max_allowed = min(8, max_recent_minutes * 1.5)  # No more than 50% above recent max
+                return min(projected_minutes, max_allowed)
+            elif avg_recent_minutes < 12:
+                # Player is occasional bench - cap conservatively
+                max_allowed = min(20, max_recent_minutes * 1.3)  # No more than 30% above recent max
+                return min(projected_minutes, max_allowed)
+            elif avg_recent_minutes < 20:
+                # Player is rotation but not starter
+                max_allowed = min(30, max_recent_minutes * 1.2)  # No more than 20% above recent max
+                return min(projected_minutes, max_allowed)
+
+        # Base caps on minutes based on role and usage (your existing logic)
         max_minutes = 36
-        
+
         if usage_rate < 0.15:  # Low usage role player
             max_minutes = 28
         elif usage_rate < 0.20:  # Medium usage
@@ -1010,18 +1660,44 @@ class EnhancedProjectionsNBAData:
             max_minutes = 36
         else:  # Star player
             max_minutes = 38
-        
+
         # Additional position-based caps
         if position == 'C':
-            max_minutes = min(max_minutes, 34)  # Centers often play fewer minutes
-        
-        # NEW: Role stability adjustment to max minutes
+            max_minutes = min(max_minutes, 34)
+
+        # Role stability adjustment
         if role_stability < 60:  # Low stability players
             max_minutes *= 0.9   # 10% reduction
         elif role_stability > 80:  # High stability players
             max_minutes *= 1.05  # 5% increase
-        
+
         return min(projected_minutes, max_minutes)
+
+    # def apply_minutes_reality_check_enhanced(self, projected_minutes, player_name, position, usage_rate, role_stability):
+    #     """Enhanced minutes reality check with role stability"""
+    #     # Base caps on minutes based on role and usage
+    #     max_minutes = 36
+        
+    #     if usage_rate < 0.15:  # Low usage role player
+    #         max_minutes = 28
+    #     elif usage_rate < 0.20:  # Medium usage
+    #         max_minutes = 32
+    #     elif usage_rate < 0.25:  # High usage
+    #         max_minutes = 36
+    #     else:  # Star player
+    #         max_minutes = 38
+        
+    #     # Additional position-based caps
+    #     if position == 'C':
+    #         max_minutes = min(max_minutes, 34)  # Centers often play fewer minutes
+        
+    #     # NEW: Role stability adjustment to max minutes
+    #     if role_stability < 60:  # Low stability players
+    #         max_minutes *= 0.9   # 10% reduction
+    #     elif role_stability > 80:  # High stability players
+    #         max_minutes *= 1.05  # 5% increase
+        
+    #     return min(projected_minutes, max_minutes)
 
     def calculate_ceiling_projection_enhanced(self, recent_games, projected_minutes, role_stability, volatility_score):
         """Enhanced ceiling projection with uncertainty ranges"""
@@ -1146,32 +1822,85 @@ class EnhancedProjectionsNBAData:
             
         except:
             return 0
-
+        
     def apply_projection_reality_checks_enhanced(self, projection, player_name, position, salary, usage_rate, consistency_rating, projected_minutes, role_stability, volatility_score):
-        """Enhanced reality checks with role stability"""
+        """Enhanced reality checks - MORE AGGRESSIVE"""
+
+        # Get recent fantasy point production
+        recent_fantasy_points = self.get_recent_fantasy_production(player_name)
+
+        # If we have recent production data, use it to cap projections
+        if recent_fantasy_points and len(recent_fantasy_points) >= 3:
+            avg_recent_fp = sum(recent_fantasy_points) / len(recent_fantasy_points)
+            max_recent_fp = max(recent_fantasy_points)
+
+            # CRITICAL: Cap projections based on actual recent production
+            if avg_recent_fp < 10:
+                # Player produces very little - cap aggressively
+                max_allowed_fp = min(15, max_recent_fp * 1.5)
+                projection = min(projection, max_allowed_fp)
+            elif avg_recent_fp < 20:
+                # Moderate producer - cap conservatively
+                max_allowed_fp = min(30, max_recent_fp * 1.3)
+                projection = min(projection, max_allowed_fp)
+            elif avg_recent_fp < 30:
+                # Good producer - reasonable cap
+                max_allowed_fp = min(45, max_recent_fp * 1.2)
+                projection = min(projection, max_allowed_fp)
+
         # Cap projections based on salary and role
         max_projection_by_salary = salary * 0.008  # $1,000 salary = 8x max projection
-        
+
         if usage_rate < 0.15:  # Low usage role players
             max_projection_by_salary *= 0.8  # 20% reduction
-        
+
         # Apply consistency adjustment
         consistency_adjustment = consistency_rating / 100
-        
-        # NEW: Role stability adjustment
+
+        # Role stability adjustment
         stability_adjustment = 0.9 + (role_stability / 100 * 0.2)  # 0.9-1.1
-        
+
         # Apply minutes-based cap (adjust based on volatility)
         if usage_rate < 0.20:
             volatility_multiplier = 1.5 - (volatility_score - 1.0) * 0.2  # More volatile = lower multiplier
             max_by_minutes = projected_minutes * max(1.0, volatility_multiplier)
             projection = min(projection, max_by_minutes)
-        
+
         projection = min(projection, max_projection_by_salary)
         projection *= consistency_adjustment
         projection *= stability_adjustment
-        
+
+        # FINAL AGGRESSIVE CHECK: If projected minutes < 10, cap projection aggressively
+        if projected_minutes < 10:
+            projection = min(projection, 15)  # Can't score much in <10 minutes
+
         return projection
+
+    # def apply_projection_reality_checks_enhanced(self, projection, player_name, position, salary, usage_rate, consistency_rating, projected_minutes, role_stability, volatility_score):
+    #     """Enhanced reality checks with role stability"""
+    #     # Cap projections based on salary and role
+    #     max_projection_by_salary = salary * 0.008  # $1,000 salary = 8x max projection
+        
+    #     if usage_rate < 0.15:  # Low usage role players
+    #         max_projection_by_salary *= 0.8  # 20% reduction
+        
+    #     # Apply consistency adjustment
+    #     consistency_adjustment = consistency_rating / 100
+        
+    #     # NEW: Role stability adjustment
+    #     stability_adjustment = 0.9 + (role_stability / 100 * 0.2)  # 0.9-1.1
+        
+    #     # Apply minutes-based cap (adjust based on volatility)
+    #     if usage_rate < 0.20:
+    #         volatility_multiplier = 1.5 - (volatility_score - 1.0) * 0.2  # More volatile = lower multiplier
+    #         max_by_minutes = projected_minutes * max(1.0, volatility_multiplier)
+    #         projection = min(projection, max_by_minutes)
+        
+    #     projection = min(projection, max_projection_by_salary)
+    #     projection *= consistency_adjustment
+    #     projection *= stability_adjustment
+        
+    #     return projection
 
     def calculate_bargain_rating_enhanced(self, projection, salary, usage_rate, plus_minus_rating, fantasy_points_per_minute, consistency_rating, role_stability, opportunity_rating):
         """Enhanced bargain rating with stability and opportunity"""
@@ -1820,6 +2549,18 @@ class EnhancedProjectionsNBAData:
         if not all_players_with_teams:
             print("❌ No players with teams found")
             return []
+        
+        # Filter to today's players (now filtered to DK slate)
+        todays_players = []
+        for player in all_players_with_teams:
+            if player.get('team') in self.todays_games:
+                todays_players.append(player)
+
+        print(f"   🎯 Found {len(todays_players)} players on today's DK slate teams")
+
+        if len(todays_players) == 0:
+            print("❌ No players found for today's DK slate games")
+            return []
             
         # Filter to target date's players
         target_date_players = []
@@ -1923,6 +2664,44 @@ class EnhancedProjectionsNBAData:
         
         print(f"   ✅ Processed {processed_count} players with enhanced projections for {self.get_target_date_string()}")
         return player_data
+    
+    def apply_automatic_player_filters(self, players_data):
+        """Automatically filter out players who don't meet minimum thresholds"""
+        print("   🔍 Applying automatic player filters...")
+
+        filtered_players = []
+        excluded_count = 0
+
+        for player in players_data:
+            should_include = True
+
+            # Filter 1: Minimum recent minutes threshold
+            recent_minutes = player.get('minutes', 0)
+            projected_minutes = player.get('projected_minutes', 0)
+
+            # If player averages <5 minutes and projected for <12, likely won't play
+            if recent_minutes < 5 and projected_minutes < 12:
+                should_include = False
+                excluded_count += 1
+
+            # Filter 2: Minimum projection threshold for salary
+            value_score = (player['projection'] / player['salary']) * 1000
+            if value_score < 2.0:  # Extremely poor value
+                should_include = False
+                excluded_count += 1
+
+            # Filter 3: Role stability too low with high projection
+            if (player.get('role_stability', 50) < 40 and 
+                player['projection'] > 25):
+                should_include = False
+                excluded_count += 1
+
+            if should_include:
+                filtered_players.append(player)
+
+        print(f"   🚫 Automatically excluded {excluded_count} players")
+        print(f"   ✅ {len(filtered_players)} players passed automatic filters")
+        return filtered_players
 
     def show_data_summary_enhanced(self):
         """Enhanced data summary with new metrics"""
@@ -2055,14 +2834,131 @@ class EnhancedProjectionsNBAData:
             for player in sorted(self.players_data, key=lambda x: x.get('recent_trend', 1), reverse=True)[:5]:
                 print(f"  {player['name']}: {player.get('recent_trend', 1):.3f}")
 
-
 class EnhancedProjectionsNBAOptimizer:
-    # def __init__(self, dk_salaries_path="DKSalaries.csv"):
-    #     self.data = EnhancedProjectionsNBAData(dk_salaries_path)
-    #     self.lineup_strategies = ['balanced', 'high_upside', 'stars_and_scrubs', 'high_floor']
     def __init__(self, dk_salaries_path="DKSalaries.csv", target_date=None):
         self.data = EnhancedProjectionsNBAData(dk_salaries_path, target_date)
-        self.lineup_strategies = ['balanced', 'high_upside', 'stars_and_scrubs', 'high_floor']
+        self.lineup_strategies = ['balanced', 'high_upside', 'stars_and_scrubs', 'high_floor', 'tournament']
+
+    def identify_tournament_hammers(self, players_data):
+        """Identify the players that can actually WIN tournaments (high ceiling + low ownership)"""
+        hammers = []
+
+        for player in players_data:
+            # Must meet tournament criteria:
+            ceiling_ok = player.get('ceiling_projection', 0) >= 55  # Must have 55+ ceiling
+            projection_ok = player['projection'] >= 40  # Must have 40+ base projection
+            ownership_est = self.estimate_tournament_ownership(player)
+            low_ownership = ownership_est < 30  # Slightly higher ownership allowed for true hammers
+            has_smash_spot = self.has_tournament_smash_spot(player)
+            salary_viable = player['salary'] >= 7000  # True hammers are usually expensive
+
+            #ceiling_ok = player.get('ceiling_projection', 0) >= player['projection'] * 1.4
+            #ownership_est = self.estimate_tournament_ownership(player)
+            #low_ownership = ownership_est < 25  # Target <25% projected ownership
+            #has_smash_spot = self.has_tournament_smash_spot(player)
+            #salary_viable = player['salary'] >= 6000  # Not a pure value play
+
+            if ceiling_ok and low_ownership and has_smash_spot and salary_viable:
+                hammers.append(player)
+
+        # Sort by ceiling projection
+        hammers.sort(key=lambda x: x.get('ceiling_projection', 0), reverse=True)
+        print(f"   🔨 Found {len(hammers)} tournament hammers")
+        return hammers
+    def identify_tournament_value_smashes(self, players_data):
+        """Find the value plays that can actually SMASH in tournaments"""
+        value_smashes = []
+
+        for player in players_data:
+            # MORE AGGRESSIVE tournament value criteria:
+            salary_ok = player['salary'] <= 5500  # Slightly higher salary cap for better players
+            ceiling_high = player.get('ceiling_projection', 0) >= 35  # Must have 35+ ceiling
+            projection_ok = player['projection'] >= 25  # Must have 25+ base projection
+            minutes_path = player.get('projected_minutes', 0) >= 26  # More minutes required
+            low_ownership = self.estimate_tournament_ownership(player) < 25
+
+            # FIXED: Define has_volatility properly
+            has_volatility = player.get('volatility_score', 1) >= 1.2  # We WANT volatility in tournaments
+
+            # Known tournament value indicators
+            is_opportunity_play = self.is_opportunity_play(player)
+            has_recent_trend = player.get('recent_trend', 1) > 1.1
+
+            # FIXED: Use the properly defined has_volatility variable
+            if (salary_ok and ceiling_high and projection_ok and minutes_path and low_ownership and 
+                (has_volatility or is_opportunity_play or has_recent_trend)):
+                value_smashes.append(player)
+
+        value_smashes.sort(key=lambda x: x.get('ceiling_projection', 0), reverse=True)
+        print(f"   💥 Found {len(value_smashes)} tournament value smashes (35+ ceiling)")
+        return value_smashes
+    
+    def estimate_tournament_ownership(self, player):
+        """More accurate tournament ownership estimation"""
+        base_ownership = 0
+
+        # Salary-based ownership (different from cash)
+        if player['salary'] >= 9000:
+            base_ownership += 15  # Stars get lower ownership in tournaments
+        elif player['salary'] <= 4500:
+            base_ownership += 8   # Value plays get less ownership
+
+        # Ceiling projection boost (tournaments care about ceiling)
+        if player.get('ceiling_projection', 0) > player['projection'] * 1.5:
+            base_ownership += 10
+
+        # Popular player penalty (we want lower ownership)
+        popular_players = ['Nikola Jokic', 'Luka Doncic', 'Stephen Curry', 'LeBron James']
+        if player['name'] in popular_players:
+            base_ownership += 20
+
+        # Value score ownership (high value = higher ownership)
+        value_score = (player['projection'] / player['salary']) * 1000
+        if value_score > 6:
+            base_ownership += 15
+        elif value_score > 5:
+            base_ownership += 10
+
+        # Recent performance boost (coming off big game = chalk)
+        if player.get('recent_trend', 1) > 1.3:
+            base_ownership += 10
+
+        return min(50, base_ownership)  # Tournament ownership rarely exceeds 50%
+
+    def has_tournament_smash_spot(self, player):
+        """Check if player has legitimate tournament smash spot"""
+        # High pace game
+        if player.get('pace_adjustment', 1) > 1.05:
+            return True
+
+        # Great matchup (opponent poor defense)
+        if player.get('matchup_difficulty', 0) > 0.8:
+            return True
+
+        # Injury to teammate creating opportunity
+        if self.has_injury_opportunity(player):
+            return True
+
+        # Projected high-scoring game
+        game_total = self.get_game_total(player['team'])
+        if game_total > 230:  # High total game
+            return True
+
+        return False
+
+    def is_opportunity_play(self, player):
+        """Check if this is a true opportunity play (injuries, role change, etc.)"""
+        # Known opportunity situations from your contest results
+        opportunity_players = {
+            'Tre Mann': 'Starting PG role',
+            'Kon Knueppel': 'Increased role, hot hand',
+            'Noah Clowney': 'Injury to starter',
+            'Bub Carrington': 'Backup getting starters minutes',
+            'Kel\'el Ware': 'Clear path to 30+ minutes',
+            'Jalen Duren': 'Favorable center matchup'
+        }
+    
+        return player['name'] in opportunity_players
 
     def estimate_ownership(self, player):
         """Estimate player ownership based on salary, projection, and matchup"""
@@ -2102,55 +2998,140 @@ class EnhancedProjectionsNBAOptimizer:
 
         return min(80, base_ownership)
 
-    def get_players_by_game(self):
-        """Group players by game for stacking"""
-        game_players = {}
+    def get_game_total(self, team):
+        """Get projected game total for a team's game"""
+        try:
+            if team in self.data.matchup_data:
+                matchup = self.data.matchup_data[team]
+                opponent = matchup.get('opponent')
+                
+                if team in self.data.team_stats and opponent in self.data.team_stats:
+                    team_off = self.data.team_stats[team].get('off_rating', 110)
+                    opp_def = self.data.team_stats[opponent].get('def_rating', 110)
+                    
+                    # Simple projection: (team offense + opponent defense) / 2 * pace factor
+                    pace_factor = matchup.get('pace', 100) / 100
+                    projected_total = ((team_off + (110 - opp_def + 110)) / 2) * pace_factor
+                    return projected_total
+        except Exception as e:
+            print(f"   ⚠️ Error calculating game total for {team}: {e}")
+        
+        return 220  # Default fallback
+
+    def get_high_total_game_players(self):
+        """Get players from games with projected high totals"""
+        high_total_players = []
         for i, player in enumerate(self.data.players_data):
-            game_key = f"{player['team']}@{player.get('opponent', 'UNK')}"
-            if game_key not in game_players:
-                game_players[game_key] = []
-            game_players[game_key].append(i)
-        return game_players
-    
-    def build_tournament_lineups(self, num_lineups=20):
-        """IMPROVED tournament strategy with injury checks and better stacking"""
-        print(f"\n🏆 Building {num_lineups} IMPROVED TOURNAMENT lineups...")
+            game_total = self.get_game_total(player['team'])
+            if game_total > 225:  # High total game threshold
+                high_total_players.append(i)
+        return high_total_players
 
-        # Step 1: Filter available players
-        available_players_indices = []
+    def get_viable_team_stacks(self):
+        """Get teams that have multiple viable tournament plays"""
+        team_stacks = {}
         for i, player in enumerate(self.data.players_data):
-            availability = self.data.check_player_availability(player['name'], player['team'])
-            if availability == 'PROBABLE':
-                available_players_indices.append(i)
-            elif availability == 'GTD':
-                # Include GTD players but with caution
-                available_players_indices.append(i)
-                print(f"   ⚠️ Including GTD player: {player['name']}")
+            team = player['team']
+            if team not in team_stacks:
+                team_stacks[team] = []
+            team_stacks[team].append(i)
+        
+        # Only return teams with at least 3 viable players
+        return {team: players for team, players in team_stacks.items() if len(players) >= 3}
 
-        print(f"   Available players: {len(available_players_indices)}/{len(self.data.players_data)}")
+    def has_injury_opportunity(self, player):
+        """Check if player benefits from teammate injury"""
+        # This would integrate with injury news
+        # For now, manual list based on research
+        injury_opportunities = {
+            'Tre Mann': 'Starting PG with injuries to other guards',
+            'Noah Clowney': 'Benefiting from frontcourt injuries',
+            'Kel\'el Ware': 'Clear path due to team context'
+        }
+        return player['name'] in injury_opportunities
 
-        # Step 2: Identify key elements for tournament success
-        high_total_games = self.identify_high_total_games()
-        value_plays = self.find_tournament_value_plays()
-        winning_profiles = self.identify_winning_profiles()
+    def add_injury_constraints(self, prob, player_vars):
+        """Add constraints to exclude injured players"""
+        injured_players = []
+        for i, player in enumerate(self.data.players_data):
+            status = self.data.check_player_availability(player['name'], player['team'])
+            if status == 'OUT':
+                injured_players.append(i)
+        
+        # Force injured players to 0
+        for injured_idx in injured_players:
+            prob += player_vars[injured_idx] == 0
 
-        print(f"   Tournament elements:")
-        print(f"     - High-total games: {len(high_total_games)}")
-        print(f"     - Value plays: {len(value_plays)}")
+    def build_lineups(self, strategy='balanced', num_lineups=1):
+        """Build lineups using different strategies"""
+        print(f"\n🚀 ENHANCED PROJECTIONS NBA DFS LINEUP BUILDER v2 - {strategy.upper()} STRATEGY")
+        print("Using role stability, blowout risk, opportunity ratings, and trend analysis")
+        print("=" * 60)
+        
+        if not self.data.get_real_nba_data_faster():
+            print("💥 Failed to get enhanced NBA data")
+            return False
+        
+        if len(self.data.players_data) < 8:
+            print(f"💥 Only {len(self.data.players_data)} players found, need at least 8")
+            return False
+        
+        lineups = []
+        
+        if strategy == 'high_upside':
+            lineups = self.build_high_upside_lineups(num_lineups)
+        elif strategy == 'stars_and_scrubs':
+            lineups = self.build_stars_and_scrubs_lineups(num_lineups)
+        elif strategy == 'high_floor':
+            lineups = self.build_high_floor_lineups(num_lineups)
+        elif strategy == 'tournament':
+            lineups = self.build_tournament_lineups_v2(num_lineups)
+        #elif strategy == 'CASH GAME':
+        #    lineups = self.build_cash_lineups(num_lineups)
+        else:  # balanced
+            lineup = self.optimize_lineup_faster()
+            if lineup:
+                lineups = [lineup]
+        
+        if lineups:
+            for i, lineup in enumerate(lineups):
+                if lineup:
+                    print(f"\n🏆 LINEUP {i+1} - {strategy.upper()} STRATEGY")
+                    self.display_lineup_enhanced(lineup)
+            return True
+        else:
+            print("💥 Optimization failed")
+            return False
+
+    def build_tournament_lineups_v2(self, num_lineups=20):
+        """TOURNAMENT-SPECIFIC lineup building based on actual winning patterns"""
+        print(f"\n🏆 Building {num_lineups} TOURNAMENT lineups (v2)...")
+
+        min_tournament_projection = self.calculate_minimum_tournament_projection()
+
+        # NEW: Tournament-specific player identification
+        hammers = self.identify_tournament_hammers(self.data.players_data)
+        value_smashes = self.identify_tournament_value_smashes(self.data.players_data)
+
+        print(f"   Tournament assets: {len(hammers)} hammers, {len(value_smashes)} value smashes")
 
         lineups = []
         previous_lineups_players = []
+        lineup_count = 0
+        max_attempts = num_lineups * 3  # Prevent infinite loops
 
         for lineup_num in range(num_lineups):
-            prob = pulp.LpProblem(f"NBA_Tournament_Improved_{lineup_num}", pulp.LpMaximize)
+            prob = pulp.LpProblem(f"NBA_Tournament_v2_{lineup_num}", pulp.LpMaximize)
             player_vars = pulp.LpVariable.dicts("Player", range(len(self.data.players_data)), 0, 1, pulp.LpBinary)
 
-            # Objective: Maximize ceiling projection with ownership discount
+            # CRITICAL: ADD INJURY CONSTRAINTS TO EXCLUDE INJURED PLAYERS
+            self.add_injury_constraints(prob, player_vars)
+
+            # TOURNAMENT OBJECTIVE: Maximize CEILING with ownership leverage
             prob += pulp.lpSum([
                 player_vars[i] * (
-                    self.data.players_data[i]['ceiling_projection'] * 0.6 +  # 60% ceiling focus
-                    self.data.players_data[i]['projection'] * 0.3 +         # 30% floor
-                    (100 - self.estimate_ownership(self.data.players_data[i])) * 0.1  # 10% ownership leverage
+                    self.data.players_data[i].get('ceiling_projection', 0) * 0.7 +  # 70% ceiling focus
+                    (100 - self.estimate_tournament_ownership(self.data.players_data[i])) * 0.3  # 30% ownership leverage
                 ) for i in range(len(self.data.players_data))
             ])
 
@@ -2158,7 +3139,7 @@ class EnhancedProjectionsNBAOptimizer:
             prob += pulp.lpSum([player_vars[i] * self.data.players_data[i]['salary'] for i in range(len(self.data.players_data))]) <= 50000
             prob += pulp.lpSum([player_vars[i] for i in range(len(self.data.players_data))]) == 8
 
-            # Position constraints (existing)
+            # Position constraints
             pg_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'PG']
             sg_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'SG']
             sf_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'SF']
@@ -2176,35 +3157,50 @@ class EnhancedProjectionsNBAOptimizer:
             prob += pulp.lpSum([player_vars[i] for i in guard_players]) >= 3
             prob += pulp.lpSum([player_vars[i] for i in forward_players]) >= 3
 
-            # NEW: Enhanced stacking constraints
-            self.add_enhanced_stacking_constraints(prob, player_vars, high_total_games)
+            # TOURNAMENT-SPECIFIC CONSTRAINTS
+            # CRITICAL: MINIMUM PROJECTION CONSTRAINT - Tournament lineups need high projections!
+            min_tournament_projection = 270  # Adjust based on slate size and scoring environment
+            prob += pulp.lpSum([player_vars[i] * self.data.players_data[i]['projection'] 
+                          for i in range(len(self.data.players_data))]) >= min_tournament_projection
 
-            # Tournament-specific constraints (existing but improved)
+            # 1. REQUIRE at least 1 tournament hammer
+            hammer_indices = [i for i, p in enumerate(self.data.players_data) if p in hammers]
+            if len(hammer_indices) >= 1:
+                prob += pulp.lpSum([player_vars[i] for i in hammer_indices]) >= 1
 
-            # 1. Require at least 2 players with ceiling projection 40%+ above projection
-            high_ceiling_indices = [i for i, p in enumerate(self.data.players_data) 
-                                  if p.get('ceiling_projection', 0) >= p.get('projection', 0) * 1.4]
-            if len(high_ceiling_indices) >= 2:
-                prob += pulp.lpSum([player_vars[i] for i in high_ceiling_indices]) >= 2
+            # 2. REQUIRE at least 3 value smashes
+            value_smash_indices = [i for i, p in enumerate(self.data.players_data) if p in value_smashes]
+            if len(value_smash_indices) >= 3:
+                prob += pulp.lpSum([player_vars[i] for i in value_smash_indices]) >= 3
 
-            # 2. Limit chalky players (projected ownership > 30%)
+            # 3. MAXIMUM ownership constraints (avoid chalk)
             chalky_players = [i for i, p in enumerate(self.data.players_data) 
-                             if self.estimate_ownership(p) > 30]
+                             if self.estimate_tournament_ownership(p) > 30]
             if len(chalky_players) > 0:
-                prob += pulp.lpSum([player_vars[i] for i in chalky_players]) <= 3
+                prob += pulp.lpSum([player_vars[i] for i in chalky_players]) <= 2
 
-            # 3. Require at least 2 value plays (<$5000 with projection > 18)
-            value_play_indices = [i for i, p in enumerate(self.data.players_data) 
-                                 if p['salary'] <= 5000 and p['projection'] >= 18]
-            if len(value_play_indices) >= 2:
-                prob += pulp.lpSum([player_vars[i] for i in value_play_indices]) >= 2
+            # 4. STACK high-total games (like winning lineups did)
+            high_total_players = self.get_high_total_game_players()
+            if len(high_total_players) >= 4:
+                prob += pulp.lpSum([player_vars[i] for i in high_total_players]) >= 4
 
-            # 4. Ensure at least one elite player (salary > $8000)
-            elite_players = [i for i, p in enumerate(self.data.players_data) if p['salary'] >= 8000]
-            if len(elite_players) >= 1:
-                prob += pulp.lpSum([player_vars[i] for i in elite_players]) >= 1
+            # 5. CORRELATION: Require at least 2 players from same team (like Giannis + value)
+            team_stacks = self.get_viable_team_stacks()
+            stack_constraint_added = False
+            for team, player_indices in team_stacks.items():
+                if len(player_indices) >= 3 and not stack_constraint_added:
+                    prob += pulp.lpSum([player_vars[i] for i in player_indices]) >= 2
+                    stack_constraint_added = True
+                    print(f"   Added team stack constraint for {team}")
+                    break
+                
+            # 6. CEILING requirement: At least 4 players with 40+ ceiling
+            high_ceiling_indices = [i for i, p in enumerate(self.data.players_data) 
+                                  if p.get('ceiling_projection', 0) >= 40]
+            if len(high_ceiling_indices) >= 4:
+                prob += pulp.lpSum([player_vars[i] for i in high_ceiling_indices]) >= 4
 
-            # 5. Player diversity from previous lineups
+            # 7. Player diversity across lineups
             if lineup_num > 0 and previous_lineups_players:
                 all_prev_players = []
                 for prev_lineup in previous_lineups_players:
@@ -2220,256 +3216,52 @@ class EnhancedProjectionsNBAOptimizer:
             if prob.status == pulp.LpStatusOptimal:
                 lineup = self.extract_lineup(player_vars)
                 if lineup:
-                    lineup_indices = [i for i, p in enumerate(self.data.players_data) if player_vars[i].value() == 1]
-                    previous_lineups_players.append(lineup_indices)
-                    lineups.append(lineup)
-                    print(f"   ✅ Tournament Lineup {lineup_num + 1} built successfully")
+                    # NEW: Check if lineup meets minimum projection threshold
+                    if lineup['total_projection'] >= min_tournament_projection:
+                        lineup_indices = [i for i, p in enumerate(self.data.players_data) if player_vars[i].value() == 1]
+                        previous_lineups_players.append(lineup_indices)
+                        lineups.append(lineup)
+                        lineup_count += 1
+                    #lineup_indices = [i for i, p in enumerate(self.data.players_data) if player_vars[i].value() == 1]
+                    #previous_lineups_players.append(lineup_indices)
+                    #lineups.append(lineup)
+
+                    # Print tournament-specific lineup analysis
+                    self.analyze_tournament_lineup(lineup, lineup_num)
                 else:
                     print(f"   ❌ Failed to extract tournament lineup {lineup_num + 1}")
             else:
                 print(f"   ❌ No optimal solution found for tournament lineup {lineup_num + 1}")
-
+            # If we're struggling to find lineups, relax the minimum projection
+            if max_attempts < num_lineups * 2 and lineup_count < num_lineups / 2:
+                min_tournament_projection = 260  # Slightly lower threshold
+                print(f"   🔄 Relaxing minimum projection to {min_tournament_projection} pts") 
+        print(f"   🎯 Built {lineup_count}/{num_lineups} tournament lineups")
         return lineups
-
-    # def build_tournament_lineups(self, num_lineups=20):
-    #     """Build lineups optimized for tournament success"""
-    #     print(f"\n🏆 Building {num_lineups} TOURNAMENT lineups...")
-
-    #     lineups = []
-    #     previous_lineups_players = []
-
-    #     # Get game groupings for stacking
-    #     game_players = self.get_players_by_game()
-
-    #     for lineup_num in range(num_lineups):
-    #         prob = pulp.LpProblem(f"NBA_Tournament_{lineup_num}", pulp.LpMaximize)
-    #         player_vars = pulp.LpVariable.dicts("Player", range(len(self.data.players_data)), 0, 1, pulp.LpBinary)
-
-    #         # Objective: Maximize ceiling projection with ownership discount
-    #         prob += pulp.lpSum([
-    #             player_vars[i] * (
-    #                 self.data.players_data[i]['ceiling_projection'] * 0.6 +  # 60% ceiling focus
-    #                 self.data.players_data[i]['projection'] * 0.3 +         # 30% floor
-    #                 (100 - self.estimate_ownership(self.data.players_data[i])) * 0.1  # 10% ownership leverage
-    #             ) for i in range(len(self.data.players_data))
-    #         ])
-
-    #         # Standard constraints
-    #         prob += pulp.lpSum([player_vars[i] * self.data.players_data[i]['salary'] for i in range(len(self.data.players_data))]) <= 50000
-    #         prob += pulp.lpSum([player_vars[i] for i in range(len(self.data.players_data))]) == 8
-
-    #         # Position constraints
-    #         pg_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'PG']
-    #         sg_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'SG']
-    #         sf_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'SF']
-    #         pf_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'PF']
-    #         c_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'C']
-
-    #         prob += pulp.lpSum([player_vars[i] for i in pg_players]) >= 1
-    #         prob += pulp.lpSum([player_vars[i] for i in sg_players]) >= 1
-    #         prob += pulp.lpSum([player_vars[i] for i in sf_players]) >= 1
-    #         prob += pulp.lpSum([player_vars[i] for i in pf_players]) >= 1
-    #         prob += pulp.lpSum([player_vars[i] for i in c_players]) == 1
-
-    #         guard_players = pg_players + sg_players
-    #         forward_players = sf_players + pf_players
-    #         prob += pulp.lpSum([player_vars[i] for i in guard_players]) >= 3
-    #         prob += pulp.lpSum([player_vars[i] for i in forward_players]) >= 3
-
-    #         # Tournament-specific constraints
-
-    #         # 1. Require at least 2 players with ceiling projection 40%+ above projection
-    #         high_ceiling_indices = [i for i, p in enumerate(self.data.players_data) 
-    #                               if p.get('ceiling_projection', 0) >= p.get('projection', 0) * 1.4]
-    #         if len(high_ceiling_indices) >= 2:
-    #             prob += pulp.lpSum([player_vars[i] for i in high_ceiling_indices]) >= 2
-
-    #         # 2. Limit chalky players (projected ownership > 30%)
-    #         chalky_players = [i for i, p in enumerate(self.data.players_data) 
-    #                          if self.estimate_ownership(p) > 30]
-    #         if len(chalky_players) > 0:
-    #             prob += pulp.lpSum([player_vars[i] for i in chalky_players]) <= 3
-
-    #         # 3. Require at least 1 value play (<$4500 with projection > 20)
-    #         value_plays = [i for i, p in enumerate(self.data.players_data) 
-    #                       if p['salary'] <= 4500 and p['projection'] >= 20]
-    #         if len(value_plays) >= 1:
-    #             prob += pulp.lpSum([player_vars[i] for i in value_plays]) >= 1
-
-    #         # 4. Game stacking: Require at least 2 players from the same game
-    #         # Create a constraint for each game to have at least 2 players
-    #         game_stack_constraint_added = False
-    #         for game_id, game_player_indices in game_players.items():
-    #             if len(game_player_indices) >= 2 and not game_stack_constraint_added:
-    #                 # Add constraint for this game to have at least 2 players
-    #                 prob += pulp.lpSum([player_vars[i] for i in game_player_indices]) >= 2
-    #                 game_stack_constraint_added = True
-    #                 break  # Only require one game stack
-                
-    #         # 5. Ensure at least one elite player (salary > $8000)
-    #         elite_players = [i for i, p in enumerate(self.data.players_data) if p['salary'] >= 8000]
-    #         if len(elite_players) >= 1:
-    #             prob += pulp.lpSum([player_vars[i] for i in elite_players]) >= 1
-
-    #         # 6. Player diversity from previous lineups
-    #         if lineup_num > 0 and previous_lineups_players:
-    #             all_prev_players = []
-    #             for prev_lineup in previous_lineups_players:
-    #                 all_prev_players.extend(prev_lineup)
-    #             all_prev_players = list(set(all_prev_players))
-
-    #             if len(all_prev_players) > 0:
-    #                 prob += pulp.lpSum([player_vars[i] for i in all_prev_players]) <= 4
-
-    #         # Solve
-    #         prob.solve(pulp.PULP_CBC_CMD(msg=0))
-
-    #         if prob.status == pulp.LpStatusOptimal:
-    #             lineup = self.extract_lineup(player_vars)
-    #             if lineup:
-    #                 lineup_indices = [i for i, p in enumerate(self.data.players_data) if player_vars[i].value() == 1]
-    #                 previous_lineups_players.append(lineup_indices)
-    #                 lineups.append(lineup)
-    #                 print(f"   ✅ Tournament Lineup {lineup_num + 1} built successfully")
-    #             else:
-    #                 print(f"   ❌ Failed to extract tournament lineup {lineup_num + 1}")
-    #         else:
-    #             print(f"   ❌ No optimal solution found for tournament lineup {lineup_num + 1}")
-    #             # Try with relaxed constraints
-    #             if 'game_stack' in locals():
-    #                 prob.constraints = {name: constraint for name, constraint in prob.constraints.items() 
-    #                                   if 'game_stack' not in name}
-    #                 prob.solve(pulp.PULP_CBC_CMD(msg=0))
-
-    #                 if prob.status == pulp.LpStatusOptimal:
-    #                     lineup = self.extract_lineup(player_vars)
-    #                     if lineup:
-    #                         lineup_indices = [i for i, p in enumerate(self.data.players_data) if player_vars[i].value() == 1]
-    #                         previous_lineups_players.append(lineup_indices)
-    #                         lineups.append(lineup)
-    #                         print(f"   ✅ Tournament Lineup {lineup_num + 1} built with relaxed constraints")
-
-    #     return lineups
     
-    def identify_winning_profiles(self):
-        """Identify player profiles that win tournaments based on historical data"""
-        winning_profiles = {
-            'high_usage_stars': ['Nikola Jokic', 'Luka Doncic', 'Giannis Antetokounmpo', 'Joel Embiid', 'Stephen Curry'],
-            'value_guards': ['Jose Alvarado', 'Amen Thompson', 'Payton Pritchard', 'Derrick White', 'Alex Caruso'],
-            'value_centers': ['Daniel Gafford', 'Nic Claxton', 'Jusuf Nurkic', 'Neemias Queta', 'Isaiah Stewart'],
-            'high_minute_roles': ['Herbert Jones', 'Saddiq Bey', 'Christian Braun', 'Tari Eason', 'OG Anunoby']
-        }
-        return winning_profiles
+    def calculate_minimum_tournament_projection(self):
+        """Calculate minimum projection based on slate size and scoring environment"""
+        slate_size = len(self.data.todays_games) / 2  # Number of games
 
-    def identify_high_total_games(self):
-        """Identify games with high projected totals for stacking"""
-        high_total_games = []
-        for game_key, game_data in self.data.game_pace_data.items():
-            # Games with high pace and poor defense are better for fantasy
-            if (game_data.get('pace', 100) > 102 and 
-                (game_data.get('home_def_rating', 110) > 108 or 
-                 game_data.get('away_def_rating', 110) > 108)):
-                high_total_games.append(game_key)
+        if slate_size <= 3:  # Small slate
+            return 280
+        elif slate_size <= 6:  # Medium slate
+            return 270  
+        elif slate_size <= 9:  # Large slate
+            return 260
+        else:  # Massive slate
+            return 250
 
-        print(f"   High-total games identified: {high_total_games}")
-        return high_total_games
-
-    def find_tournament_value_plays(self):
-        """Find the types of value plays that actually win tournaments"""
-        value_plays = []
-
-        for player in self.data.players_data:
-            # Criteria based on your winning lineups analysis:
-            # 1. Minutes > 20
-            # 2. Salary < $5000  
-            # 3. Recent production > 15 fantasy points
-            # 4. Not too volatile
-
-            if (player['salary'] <= 5000 and 
-                player.get('projected_minutes', 0) >= 20 and
-                player.get('projection', 0) >= 18 and
-                player.get('volatility_score', 1) <= 1.1 and
-                player.get('role_stability', 0) >= 60):
-
-                value_plays.append(player)
-
-        # Sort by value (points per dollar)
-        value_plays.sort(key=lambda x: x['projection'] / x['salary'], reverse=True)
-
-        print(f"   Found {len(value_plays)} tournament value plays")
-        return value_plays
-    
-    def add_enhanced_stacking_constraints(self, prob, player_vars, high_total_games):
-        """Add better stacking constraints based on winning patterns"""
-
-        # Require at least 3 players from high-total games
-        high_total_players = []
-        for i, player in enumerate(self.data.players_data):
-            game_key = f"{player['team']}@{player.get('opponent', 'UNK')}"
-            if game_key in high_total_games:
-                high_total_players.append(i)
-
-        if len(high_total_players) >= 3:
-            prob += pulp.lpSum([player_vars[i] for i in high_total_players]) >= 3
-            print(f"   Added high-total game constraint: {len(high_total_players)} players")
-
-        # Require correlation - players from same team
-        teams_with_multiple_viable_players = {}
-        for i, player in enumerate(self.data.players_data):
-            team = player['team']
-            if team not in teams_with_multiple_viable_players:
-                teams_with_multiple_viable_players[team] = []
-            teams_with_multiple_viable_players[team].append(i)
-
-        # For at least one team, require 2+ players
-        team_constraint_added = False
-        for team, player_indices in teams_with_multiple_viable_players.items():
-            if len(player_indices) >= 3:  # Only if team has multiple viable options
-                prob += pulp.lpSum([player_vars[i] for i in player_indices]) >= 2
-                print(f"   Added team stack constraint for {team}")
-                team_constraint_added = True
-                break  # Only require for one team
-            
-        return team_constraint_added
+    def analyze_tournament_lineup(self, lineup, lineup_num):
+        """Analyze lineup for tournament viability"""
+        total_ceiling = sum(p.get('ceiling_projection', p['projection']) for p in lineup['players'])
+        avg_ownership = sum(self.estimate_tournament_ownership(p) for p in lineup['players']) / 8
+        value_smashes = [p for p in lineup['players'] if p['salary'] <= 5000 and p.get('ceiling_projection', 0) >= 30]
+        hammers = [p for p in lineup['players'] if p['salary'] >= 7000 and p.get('ceiling_projection', 0) >= 55]
         
-    def build_lineups(self, strategy='balanced', num_lineups=1):
-        """Build lineups using different strategies"""
-        print(f"\n🚀 ENHANCED PROJECTIONS NBA DFS LINEUP BUILDER v2 - {strategy.upper()} STRATEGY")
-        print("Using role stability, blowout risk, opportunity ratings, and trend analysis")
-        print("=" * 60)
-        
-        if not self.data.get_real_nba_data():
-            print("💥 Failed to get enhanced NBA data")
-            return False
-            
-        if len(self.data.players_data) < 8:
-            print(f"💥 Only {len(self.data.players_data)} players found, need at least 8")
-            return False
-        
-        lineups = []
-        
-        if strategy == 'high_upside':
-            lineups = self.build_high_upside_lineups(num_lineups)
-        elif strategy == 'stars_and_scrubs':
-            lineups = self.build_stars_and_scrubs_lineups(num_lineups)
-        elif strategy == 'high_floor':
-            lineups = self.build_high_floor_lineups(num_lineups)
-        elif strategy == 'tournament':  # NEW: Tournament strategy
-            lineups = self.build_tournament_lineups(num_lineups)
-        else:  # balanced
-            lineup = self.optimize_lineup()
-            if lineup:
-                lineups = [lineup]
-        
-        if lineups:
-            for i, lineup in enumerate(lineups):
-                if lineup:
-                    print(f"\n🏆 LINEUP {i+1} - {strategy.upper()} STRATEGY")
-                    self.display_lineup_enhanced(lineup)
-            return True
-        else:
-            print("💥 Optimization failed")
-            return False
+        print(f"   ✅ Tournament Lineup {lineup_num + 1}:")
+        print(f"      Ceiling: {total_ceiling:.1f} | Avg Ownership: {avg_ownership:.1f}%")
+        print(f"      Hammers: {len(hammers)} | Value Smashes: {len(value_smashes)}")
 
     def build_high_upside_lineups(self, num_lineups=3):
         """Build lineups focused on high upside players"""
@@ -2492,6 +3284,7 @@ class EnhancedProjectionsNBAOptimizer:
             
             prob = pulp.LpProblem(f"NBA_DFS_High_Upside_{lineup_num}", pulp.LpMaximize)
             player_vars = pulp.LpVariable.dicts("Player", range(len(self.data.players_data)), 0, 1, pulp.LpBinary)
+            self.add_injury_constraints(prob, player_vars)
             
             # Objective: Maximize both projection and upside score
             prob += pulp.lpSum([
@@ -2533,18 +3326,14 @@ class EnhancedProjectionsNBAOptimizer:
             if len(high_ceiling_indices) >= 2:
                 prob += pulp.lpSum([player_vars[i] for i in high_ceiling_indices]) >= 2
             
-            # **CRITICAL FIX: Prevent same players from previous lineups**
-            # For lineup 2+, ensure at least 3 different players from previous lineups
+            # Prevent same players from previous lineups
             if lineup_num > 0 and previous_lineups_players:
-                # Get all players from previous lineups
                 all_prev_players = []
                 for prev_lineup in previous_lineups_players:
                     all_prev_players.extend(prev_lineup)
                 
-                # Remove duplicates
                 all_prev_players = list(set(all_prev_players))
                 
-                # Ensure at least 3 players are different from all previous lineups
                 if len(all_prev_players) > 0:
                     prob += pulp.lpSum([player_vars[i] for i in all_prev_players]) <= 5
             
@@ -2554,7 +3343,6 @@ class EnhancedProjectionsNBAOptimizer:
             if prob.status == pulp.LpStatusOptimal:
                 lineup = self.extract_lineup(player_vars)
                 if lineup:
-                    # Store the player indices for this lineup to avoid in future lineups
                     lineup_indices = [i for i, p in enumerate(self.data.players_data) if player_vars[i].value() == 1]
                     previous_lineups_players.append(lineup_indices)
                     lineups.append(lineup)
@@ -2563,22 +3351,7 @@ class EnhancedProjectionsNBAOptimizer:
                     print(f"   ❌ Failed to extract lineup {lineup_num + 1}")
             else:
                 print(f"   ❌ No optimal solution found for lineup {lineup_num + 1}")
-                # Try with relaxed constraints
-                if lineup_num > 0 and previous_lineups_players:
-                    print("   🔄 Trying with relaxed player diversity constraint...")
-                    # Remove the diversity constraint and try again
-                    prob.constraints = {name: constraint for name, constraint in prob.constraints.items() 
-                                      if not any(keyword in name for keyword in ['diversity', 'previous'])}
-                    prob.solve(pulp.PULP_CBC_CMD(msg=0))
-                    
-                    if prob.status == pulp.LpStatusOptimal:
-                        lineup = self.extract_lineup(player_vars)
-                        if lineup:
-                            lineup_indices = [i for i, p in enumerate(self.data.players_data) if player_vars[i].value() == 1]
-                            previous_lineups_players.append(lineup_indices)
-                            lineups.append(lineup)
-                            print(f"   ✅ Lineup {lineup_num + 1} built with relaxed constraints")
-        
+    
         return lineups
 
     def build_stars_and_scrubs_lineups(self, num_lineups=2):
@@ -2637,7 +3410,7 @@ class EnhancedProjectionsNBAOptimizer:
             if len(scrub_indices) >= 3:
                 prob += pulp.lpSum([player_vars[i] for i in scrub_indices]) >= 3
             
-            # **FIX: Prevent same players from previous lineups**
+            # Prevent same players from previous lineups
             if lineup_num > 0 and previous_lineups_players:
                 all_prev_players = []
                 for prev_lineup in previous_lineups_players:
@@ -2717,7 +3490,7 @@ class EnhancedProjectionsNBAOptimizer:
             if len(low_vol_indices) >= 4:
                 prob += pulp.lpSum([player_vars[i] for i in low_vol_indices]) >= 4
             
-            # **FIX: Prevent same players from previous lineups**
+            # Prevent same players from previous lineups
             if lineup_num > 0 and previous_lineups_players:
                 all_prev_players = []
                 for prev_lineup in previous_lineups_players:
@@ -2779,6 +3552,7 @@ class EnhancedProjectionsNBAOptimizer:
         else:
             print("   ❌ No optimal solution found for max points lineup")
             return None
+        
 
     def optimize_lineup(self):
         """Optimize lineup using enhanced projections"""
@@ -2823,6 +3597,61 @@ class EnhancedProjectionsNBAOptimizer:
         print("   Solving optimization...")
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
         
+        if prob.status == pulp.LpStatusOptimal:
+            print("   ✅ Optimization successful!")
+            return self.extract_lineup(player_vars)
+        else:
+            print("   ❌ No optimal solution found")
+            return None
+    
+    def optimize_lineup_faster(self):
+        """Faster lineup optimization"""
+        print("\n🧠 Optimizing lineup with enhanced projections (FAST)...")
+        
+        # Pre-calculate position indices for faster access
+        pg_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'PG']
+        sg_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'SG']
+        sf_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'SF']
+        pf_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'PF']
+        c_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'C']
+        
+        # Quick check for position viability
+        if (len(pg_players) < 2 or len(sg_players) < 2 or len(sf_players) < 2 or 
+            len(pf_players) < 2 or len(c_players) < 2):
+            print("❌ Not enough players for viable lineup construction")
+            return None
+        
+        prob = pulp.LpProblem("NBA_DFS_Enhanced_Fast", pulp.LpMaximize)
+        player_vars = pulp.LpVariable.dicts("Player", range(len(self.data.players_data)), 0, 1, pulp.LpBinary)
+
+        # Objective
+        prob += pulp.lpSum([player_vars[i] * self.data.players_data[i]['projection'] for i in range(len(self.data.players_data))])
+
+        # Constraints
+        prob += pulp.lpSum([player_vars[i] * self.data.players_data[i]['salary'] for i in range(len(self.data.players_data))]) <= 50000
+        prob += pulp.lpSum([player_vars[i] for i in range(len(self.data.players_data))]) == 8
+
+        # Use pre-calculated position indices
+        prob += pulp.lpSum([player_vars[i] for i in pg_players]) >= 1
+        prob += pulp.lpSum([player_vars[i] for i in sg_players]) >= 1
+        prob += pulp.lpSum([player_vars[i] for i in sf_players]) >= 1
+        prob += pulp.lpSum([player_vars[i] for i in pf_players]) >= 1
+        prob += pulp.lpSum([player_vars[i] for i in c_players]) == 1
+
+        guard_players = pg_players + sg_players
+        forward_players = sf_players + pf_players
+        prob += pulp.lpSum([player_vars[i] for i in guard_players]) >= 3
+        prob += pulp.lpSum([player_vars[i] for i in forward_players]) >= 3
+
+        # Solve with timeout
+        print("   Solving optimization (fast mode)...")
+        try:
+            # Use faster solver with timeout
+            prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=30))  # 30 second timeout
+        except:
+            # Fallback to regular solve
+            prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
         if prob.status == pulp.LpStatusOptimal:
             print("   ✅ Optimization successful!")
             return self.extract_lineup(player_vars)
@@ -2890,7 +3719,7 @@ class EnhancedProjectionsNBAOptimizer:
                   f"TREND: {player.get('recent_trend', 1):.2f} {trend_indicator} | "
                   f"OPP: {player.get('opportunity_rating', 0):2.0f} {opportunity_indicator} | "
                   f"{location_indicator}{b2b_indicator} vs {player.get('opponent', 'UNK'):3} {matchup_indicator}")
-    
+
         print("=" * 140)
         print(f"💵 Total Salary: ${lineup['total_salary']:,} / $50,000")
         print(f"📈 Total Projection: {lineup['total_projection']:.1f} fantasy points")
@@ -2951,7 +3780,8 @@ class CashGameNBAOptimizer(EnhancedProjectionsNBAOptimizer):
         """Build lineups optimized for cash games (Double Ups, 50/50s)"""
         print(f"\n💰 Building {num_lineups} CASH GAME lineups ({strategy})...")
         
-        if not self.data.get_real_nba_data():
+        #if not self.data.get_real_nba_data():
+        if not self.data.get_real_nba_data_faster():
             print("💥 Failed to get NBA data")
             return []
             
@@ -2970,15 +3800,37 @@ class CashGameNBAOptimizer(EnhancedProjectionsNBAOptimizer):
         """Balanced cash approach with 1 elite anchor + value"""
         lineups = []
         previous_lineups_players = []
+
+        # PRE-CALCULATE indices for faster access
+        pg_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'PG']
+        sg_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'SG']
+        sf_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'SF']
+        pf_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'PF']
+        c_players = [i for i, p in enumerate(self.data.players_data) if p['position'] == 'C']
+
+        guard_players = pg_players + sg_players
+        forward_players = sf_players + pf_players
+
+        # PRE-CALCULATE player groups for constraints
+        elite_anchors = [i for i, p in enumerate(self.data.players_data) 
+                       if p['salary'] >= 9000 and p['projection'] >= 50]
+        consistent_players = [i for i, p in enumerate(self.data.players_data) 
+                            if p.get('consistency_rating', 0) >= 60]
+        stable_players = [i for i, p in enumerate(self.data.players_data) 
+                        if p.get('role_stability', 0) >= 60]
+        value_plays = [i for i, p in enumerate(self.data.players_data) 
+                     if p['salary'] <= 5000 and p['projection'] >= 20]
         
         for lineup_num in range(num_lineups):
             prob = pulp.LpProblem(f"NBA_Cash_Balanced_{lineup_num}", pulp.LpMaximize)
             player_vars = pulp.LpVariable.dicts("Player", range(len(self.data.players_data)), 0, 1, pulp.LpBinary)
+            # ADD INJURY CONSTRAINTS
+            self.add_injury_constraints(prob, player_vars)
             
             # CASH GAME OBJECTIVE: Maximize floor projection with consistency bonus
             prob += pulp.lpSum([
                 player_vars[i] * (
-                    self.data.players_data[i]['projection'] * 0.6 +           # 60% projection
+                    self.data.players_data[i]['projection'] * 0.7 +           # 60% projection
                     self.data.players_data[i].get('floor_projection', 0) * 0.3 +  # 30% floor
                     self.data.players_data[i]['consistency_rating'] * 0.1     # 10% consistency
                 ) for i in range(len(self.data.players_data))
@@ -3055,7 +3907,11 @@ class CashGameNBAOptimizer(EnhancedProjectionsNBAOptimizer):
                     prob += pulp.lpSum([player_vars[i] for i in all_prev_players]) <= 4
             
             # Solve
-            prob.solve(pulp.PULP_CBC_CMD(msg=0))
+            #prob.solve(pulp.PULP_CBC_CMD(msg=0))
+            try:
+                prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=30))  # 30 second timeout
+            except:
+                prob.solve(pulp.PULP_CBC_CMD(msg=0))
             
             if prob.status == pulp.LpStatusOptimal:
                 lineup = self.extract_lineup(player_vars)
@@ -3498,163 +4354,3 @@ if __name__ == "__main__":
     else:
         print(f"\n✅ Successfully built lineups for {target_date.strftime('%Y-%m-%d')}")
 
-# if __name__ == "__main__":
-#     print("🎯 ENHANCED PROJECTIONS NBA DFS LINEUP BUILDER v2")
-#     print("With role stability, blowout risk, opportunity ratings, and trend analysis")
-#     print()
-    
-#     dk_file = "DKSalaries.csv"
-#     if not os.path.exists(dk_file):
-#         print(f"❌ {dk_file} not found")
-#         print("Please make sure your DraftKings salaries file is in the same directory")
-#         sys.exit(1)
-    
-#     try:
-#         from nba_api.stats.endpoints import commonplayerinfo, scoreboardv2, leaguedashteamstats, teamgamelogs
-#         print("✅ nba_api is installed and working")
-#         print(f"✅ Found {dk_file}")
-#     except ImportError:
-#         print("❌ nba_api not installed")
-#         print("Run: pip install nba_api")
-#         sys.exit(1)
-    
-#     optimizer = EnhancedProjectionsNBAOptimizer(dk_file)
-    
-#     # Ask user for strategy preference
-#     print("\n🎯 Available Lineup Strategies:")
-#     print("1. Balanced (default)")
-#     print("2. High Upside (tournament focus)")
-#     print("3. Stars & Scrubs (premium players + value picks)")
-#     print("4. High Floor (cash game focus)")
-#     print("5. Maximum Points (pure projection optimization)")
-#     print("6. Tournament Focus (20 lineups)")
-#     print("7. CASH GAME Strategies")
-#     print("8. Build ALL strategies")
-    
-#     choice = input("\nSelect strategy (1-8, default 1): ").strip()
-
-#     if choice == "7":
-#         # CASH GAME Strategies
-#         print("\n💰 CASH GAME STRATEGIES:")
-#         print("1. Balanced Cash (recommended)")
-#         print("2. Elite Anchor Focus") 
-#         print("3. Value Focus")
-#         print("4. Build ALL Cash Strategies")
-        
-#         cash_choice = input("\nSelect cash strategy (1-4, default 1): ").strip()
-        
-#         cash_optimizer = CashGameNBAOptimizer(dk_file)
-        
-#         if cash_choice == "2":
-#             lineups = cash_optimizer.build_cash_lineups(strategy='cash_elite_anchor', num_lineups=3)
-#         elif cash_choice == "3":
-#             lineups = cash_optimizer.build_cash_lineups(strategy='cash_value_focus', num_lineups=3)
-#         elif cash_choice == "4":
-#             # Build all cash strategies
-#             print("\n🏗️  Building ALL cash game strategies...")
-#             lineups1 = cash_optimizer.build_cash_lineups(strategy='cash_balanced', num_lineups=2)
-#             lineups2 = cash_optimizer.build_cash_lineups(strategy='cash_elite_anchor', num_lineups=2)
-#             lineups3 = cash_optimizer.build_cash_lineups(strategy='cash_value_focus', num_lineups=2)
-#             lineups = lineups1 + lineups2 + lineups3
-#         else:
-#             lineups = cash_optimizer.build_cash_lineups(strategy='cash_balanced', num_lineups=3)
-        
-#         if lineups:
-#             for i, lineup in enumerate(lineups):
-#                 if lineup:
-#                     print(f"\n💰 CASH LINEUP {i+1}")
-#                     cash_optimizer.display_cash_lineup_analysis(lineup)
-#             success = True
-#         else:
-#             success = False
-            
-#     # ... (keep all your existing choice handling code for options 1-6 and 8) ...
-#     elif choice == "2":
-#         # High Upside strategy (your existing code)
-#         num_lineups = input("How many high-upside lineups? (default 3): ").strip()
-#         num_lineups = int(num_lineups) if num_lineups.isdigit() else 3
-#         optimizer = EnhancedProjectionsNBAOptimizer(dk_file)
-#         success = optimizer.build_lineups(strategy='high_upside', num_lineups=num_lineups)
-    
-#     if choice == "2":
-#         # High Upside strategy
-#         num_lineups = input("How many high-upside lineups? (default 3): ").strip()
-#         num_lineups = int(num_lineups) if num_lineups.isdigit() else 3
-#         success = optimizer.build_lineups(strategy='high_upside', num_lineups=num_lineups)
-        
-#     elif choice == "3":
-#         # Stars & Scrubs strategy
-#         num_lineups = input("How many stars & scrubs lineups? (default 2): ").strip()
-#         num_lineups = int(num_lineups) if num_lineups.isdigit() else 2
-#         success = optimizer.build_lineups(strategy='stars_and_scrubs', num_lineups=num_lineups)
-        
-#     elif choice == "4":
-#         # High Floor strategy
-#         num_lineups = input("How many high-floor lineups? (default 2): ").strip()
-#         num_lineups = int(num_lineups) if num_lineups.isdigit() else 2
-#         success = optimizer.build_lineups(strategy='high_floor', num_lineups=num_lineups)
-        
-#     elif choice == "5":
-#         # Maximum Points strategy
-#         max_points_lineup = optimizer.optimize_max_points_lineup()
-#         if max_points_lineup:
-#             print("\n💥 MAXIMUM POINTS LINEUP (Pure Projection Optimization)")
-#             optimizer.display_lineup_enhanced(max_points_lineup)
-#             success = True
-#         else:
-#             success = False
-
-#     elif choice == "6":
-#         # Tournament Focus strategy
-#         num_lineups = input("How many tournament lineups? (default 20): ").strip()
-#         num_lineups = int(num_lineups) if num_lineups.isdigit() else 20
-#         success = optimizer.build_lineups(strategy='tournament', num_lineups=num_lineups)
-            
-#     elif choice == "8":
-#         # Build ALL strategies
-#         print("\n🏗️  Building ALL lineup strategies...")
-        
-#         # Balanced
-#         print("\n" + "="*60)
-#         print("⚖️  BALANCED STRATEGY")
-#         print("="*60)
-#         balanced_success = optimizer.build_lineups(strategy='balanced', num_lineups=1)
-        
-#         # High Upside
-#         print("\n" + "="*60)
-#         print("🚀 HIGH UPSIDE STRATEGY")
-#         print("="*60)
-#         upside_success = optimizer.build_lineups(strategy='high_upside', num_lineups=2)
-        
-#         # Stars & Scrubs
-#         print("\n" + "="*60)
-#         print("⭐ STARS & SCRUBS STRATEGY")
-#         print("="*60)
-#         stars_success = optimizer.build_lineups(strategy='stars_and_scrubs', num_lineups=2)
-        
-#         # High Floor
-#         print("\n" + "="*60)
-#         print("📊 HIGH FLOOR STRATEGY")
-#         print("="*60)
-#         floor_success = optimizer.build_lineups(strategy='high_floor', num_lineups=2)
-        
-#         # Maximum Points
-#         print("\n" + "="*60)
-#         print("💥 MAXIMUM POINTS STRATEGY")
-#         print("="*60)
-#         max_points_lineup = optimizer.optimize_max_points_lineup()
-#         if max_points_lineup:
-#             optimizer.display_lineup_enhanced(max_points_lineup)
-#             max_success = True
-#         else:
-#             max_success = False
-            
-#         success = balanced_success or upside_success or stars_success or floor_success or max_success
-        
-#     else:
-#         # Default: Balanced strategy
-#         success = optimizer.build_lineups(strategy='balanced', num_lineups=1)
-    
-#     if not success:
-#         print("\n💥 Failed to build lineups")
-#         sys.exit(1)
