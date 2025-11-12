@@ -14,6 +14,7 @@ from datetime import datetime
 import concurrent.futures
 import threading
 from threading import Lock
+from injurySrape import get_injuries
 
 class EnhancedProjectionsNBAData:
     #def __init__(self, dk_salaries_path="DKSalaries.csv"):
@@ -223,54 +224,49 @@ class EnhancedProjectionsNBAData:
     def check_player_availability(self, player_name, team):
         """Check if player is expected to play - CRITICAL FIX"""
         # Known injured players (update this daily based on injury reports)
-        injured_players = {
-            'Steven Adams': 'GTD',
-            'Zion Williamson': 'OUT', 
-            'Kawhi Leonard': 'GTD',
-            'Paul George': 'GTD',
-            'Lonzo Ball': 'OUT',
-            'Trae Young': 'OUT',
-            'Dean Wade': 'OUT',
-            'Dante Exum': 'OUT',
-            'Anthony Davis': 'OUT',
-            'Marcus Sasser': 'OUT',
-            'Dorian Finney-Smith': 'OUT',
-            'Jordan Poole': 'OUT',
-            'Walker Kessler': 'OUT',
-            'Jalen Suggs': 'OUT',
-            'Matisse Thybulle': 'OUT',
-            'Blake Wesley': 'OUT',
-            'Luguentz Dort': 'OUT',
-            'Bennedict Mathurin': 'OUT',
-            'Kyle Anderson': 'OUT',
-            # Add more based on daily injury reports
-        }
-
+        injured_players = get_injuries()
+        rest_players = {player: status for player, status in injured_players.items() if status.lower() in ("day-to-day", "gtd")}
+        out_players = {player: status for player, status in injured_players.items() if status.lower() == "out"}
+        print("rest_players repr:", [repr(p) for p in rest_players])
+        print("player_name repr:", repr(player_name))
         # Players who are resting or load management
-        rest_players = {
-            'LeBron James': 'GTD',
-            'Stephen Curry': 'GTD',
-            'Kevin Durant': 'GTD'
-        }
-
+        #rest_players = {
+            #'LeBron James': 'GTD',
+            #'Kevin Durant': 'GTD'
+        #}
          # Check exact match first
-        if player_name in injured_players:
-            print(f"      🚫 {player_name} is OUT (injured)")
-            return 'OUT'
-        elif player_name in rest_players:
-            print(f"      ⚠️ {player_name} is GTD (rest)")
+        if player_name in rest_players:
+            print(f"⚠️ {player_name} is GTD (rest)")
             return 'GTD'
+        elif player_name in out_players:
+            print(f"🚫 {player_name} is OUT (injured)")
+            return 'OUT'
+        # if player_name in injured_players:
+        #     print(f"      🚫 {player_name} is OUT (injured)")
+        #     return 'OUT'
+        # elif player_name in rest_players:
+        #     print(f"      ⚠️ {player_name} is GTD (rest)")
+        #     return 'GTD'
 
         # Check partial matches (in case of name variations)
-        for injured_player, status in injured_players.items():
-            if injured_player.lower() in player_name.lower():
-                print(f"      🚫 {player_name} is OUT (partial match: {injured_player})")
-                return 'OUT'
-
-        for rest_player, status in rest_players.items():
+        for rest_player in rest_players:
             if rest_player.lower() in player_name.lower():
-                print(f"      ⚠️ {player_name} is GTD (partial match: {rest_player})")
+                print(f"⚠️ {player_name} is GTD (partial match: {rest_player})")
                 return 'GTD'
+
+        for out_player in out_players:
+            if out_player.lower() in player_name.lower():
+                print(f"🚫 {player_name} is OUT (partial match: {out_player})")
+                return 'OUT'
+        # for injured_player, status in injured_players.items():
+        #     if injured_player.lower() in player_name.lower():
+        #         print(f"      🚫 {player_name} is OUT (partial match: {injured_player})")
+        #         return 'OUT'
+
+        # for rest_player, status in rest_players.items():
+        #     if rest_player.lower() in player_name.lower():
+        #         print(f"      ⚠️ {player_name} is GTD (partial match: {rest_player})")
+        #         return 'GTD'
 
         return 'PROBABLE'
 
