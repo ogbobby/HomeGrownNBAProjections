@@ -42,7 +42,38 @@ INJURY_MINUTE_ADJUSTMENTS = {
     'QUESTIONABLE': -5,
     'PROBABLE': 0
 }
-
+TEAM_NAME_TO_ABBR = {
+    "HAWKS": "ATL",
+    "CELTICS": "BOS",
+    "NETS": "BKN",
+    "HORNETS": "CHA",
+    "BULLS": "CHI",
+    "CAVALIERS": "CLE",
+    "MAVERICKS": "DAL",
+    "NUGGETS": "DEN",
+    "PISTONS": "DET",
+    "WARRIORS": "GSW",
+    "ROCKETS": "HOU",
+    "PACERS": "IND",
+    "CLIPPERS": "LAC",
+    "LAKERS": "LAL",
+    "GRIZZLIES": "MEM",
+    "HEAT": "MIA",
+    "BUCKS": "MIL",
+    "TIMBERWOLVES": "MIN",
+    "PELICANS": "NOP",
+    "NEW KNICKS": "NYK",
+    "THUNDER": "OKC",
+    "MAGIC": "ORL",
+    "76ERS": "PHI",
+    "SUNS": "PHX",
+    "TRAIL BLAZERS": "POR",
+    "KINGS": "SAC",
+    "SPURS": "SAS",
+    "RAPTORS": "TOR",
+    "JAZZ": "UTA",
+    "WIZARDS": "WAS"
+}
 # -------------------------
 # Utility: CSV header mapping
 # -------------------------
@@ -103,19 +134,10 @@ def normalize_name(name: str) -> str:
 
     return name
 
-
 def normalize_vegas_data(raw_games):
     """
-    Convert the new vegas format:
-    [
-      { 'team1': {...}, 'team2': {...}, 'matchup': 'Suns vs Thunder' },
-      ...
-    ]
-    into a dictionary keyed by TEAM ABBREVIATION:
-    {
-        'SUNS': { 'spread': +14.5, 'total': 226.5, 'team_total': 110.3 },
-        'THUNDER': { ... },
-    }
+    Convert raw Vegas API data into a dictionary keyed by TEAM ABBREVIATION
+    with computed team totals and spreads.
     """
     vegas = {}
 
@@ -123,64 +145,57 @@ def normalize_vegas_data(raw_games):
         t1 = game["team1"]
         t2 = game["team2"]
 
-        # Extract teams
-        team1_name = t1["team_name"].strip().upper()
-        team2_name = t2["team_name"].strip().upper()
+        # Normalize team names to abbreviations
+        team1_full = t1["team_name"].strip().upper()
+        team2_full = t2["team_name"].strip().upper()
+        team1_abbr = TEAM_NAME_TO_ABBR.get(team1_full)
+        team2_abbr = TEAM_NAME_TO_ABBR.get(team2_full)
 
-        # Extract O/U number (e.g., 'o226.5-110')
+        if not team1_abbr or not team2_abbr:
+            print(f"⚠️ Could not normalize teams: {team1_full}, {team2_full}")
+            continue
+
+        # Extract total game O/U
         def parse_total(val):
-            # strip o/u prefix
             if val.startswith("o") or val.startswith("u"):
                 val = val[1:]
-            # remove juice -110 etc.
             if "-" in val:
                 val = val.split("-")[0]
-            return float(val)
+            try:
+                return float(val)
+            except:
+                return 0.0
 
-        # Extract spread (e.g., '+14.5-110')
+        total = parse_total(t1.get("total", 0))
+
+        # Extract spread
         def parse_spread(raw):
-             """Parse spread strings like '+14.5-110', '-4.5 (-110)', 'PK', 'EVEN', etc."""
-             if not raw or not isinstance(raw, str):
-                 return 0.0  # safe fallback
+            if not raw or not isinstance(raw, str):
+                return 0.0
+            raw = raw.strip().lower()
+            if raw in ("pk", "pick", "pick'em", "even"):
+                return 0.0
+            m = re.search(r'([+-]?\d+\.?\d*)', raw)
+            if m:
+                try:
+                    return float(m.group(1))
+                except:
+                    return 0.0
+            return 0.0
 
-             raw = raw.strip().lower()
-
-             # Pure pick’em
-             if raw in ("pk", "pick", "pick'em", "even"):
-                 return 0.0
-
-             # Extract the first float (spread value)
-             m = re.search(r'([+-]?\d+\.?\d*)', raw)
-             if m:
-                 try:
-                     return float(m.group(1))
-                 except:
-                     return 0.0
-
-             return 0.0
-        #def parse_spread(val):
-        #    if "-" in val[1:]:  # e.g. "+14.5-110"
-        #        val = val.split("-")[0]
-        #    return float(val)
-
-        total = parse_total(t1["total"])  # total game O/U
-
-        #spread1 = parse_spread(t1["spread"])
-        #spread2 = parse_spread(t2["spread"])
         spread1 = parse_spread(t1.get("spread", ""))
         spread2 = parse_spread(t2.get("spread", ""))
 
-        # Compute Implied Team Totals
-        # Formula: team_total = (total / 2) + (spread / 2)
+        # Compute Implied Team Totals: team_total = (total / 2) + (spread / 2)
         t1_total = (total / 2) + (spread1 / 2)
         t2_total = (total / 2) + (spread2 / 2)
 
-        vegas[team1_name] = {
+        vegas[team1_abbr] = {
             "total": total,
             "spread": spread1,
             "team_total": t1_total
         }
-        vegas[team2_name] = {
+        vegas[team2_abbr] = {
             "total": total,
             "spread": spread2,
             "team_total": t2_total
@@ -188,16 +203,128 @@ def normalize_vegas_data(raw_games):
 
     return vegas
 
-def vegas_multiplier(team_abbr: str, vegas: Dict[str, Dict[str, float]]) -> float:
-    if not team_abbr:
-        return 1.0
-    data = vegas.get(team_abbr.upper(), {})
-    total = float(data.get('total', VEGAS_DEFAULT_TOTAL))
-    spread = float(data.get('spread', VEGAS_DEFAULT_SPREAD))
-    total_adj = total / VEGAS_DEFAULT_TOTAL
-    blowout_adj = 0.95 if spread <= -10 else 0.97 if spread >= 10 else 1.0
-    mult = total_adj * blowout_adj
-    return max(0.85, min(1.15, mult))
+
+# def normalize_vegas_data(raw_games):
+#     """
+#     Convert the new vegas format:
+#     [
+#       { 'team1': {...}, 'team2': {...}, 'matchup': 'Suns vs Thunder' },
+#       ...
+#     ]
+#     into a dictionary keyed by TEAM ABBREVIATION:
+#     {
+#         'SUNS': { 'spread': +14.5, 'total': 226.5, 'team_total': 110.3 },
+#         'THUNDER': { ... },
+#     }
+#     """
+#     vegas = {}
+
+#     for game in raw_games:
+#         t1 = game["team1"]
+#         t2 = game["team2"]
+
+#         # Extract teams
+#         team1_name = t1["team_name"].strip().upper()
+#         team2_name = t2["team_name"].strip().upper()
+
+#         # Extract O/U number (e.g., 'o226.5-110')
+#         def parse_total(val):
+#             # strip o/u prefix
+#             if val.startswith("o") or val.startswith("u"):
+#                 val = val[1:]
+#             # remove juice -110 etc.
+#             if "-" in val:
+#                 val = val.split("-")[0]
+#             return float(val)
+
+#         # Extract spread (e.g., '+14.5-110')
+#         def parse_spread(raw):
+#              """Parse spread strings like '+14.5-110', '-4.5 (-110)', 'PK', 'EVEN', etc."""
+#              if not raw or not isinstance(raw, str):
+#                  return 0.0  # safe fallback
+
+#              raw = raw.strip().lower()
+
+#              # Pure pick’em
+#              if raw in ("pk", "pick", "pick'em", "even"):
+#                  return 0.0
+
+#              # Extract the first float (spread value)
+#              m = re.search(r'([+-]?\d+\.?\d*)', raw)
+#              if m:
+#                  try:
+#                      return float(m.group(1))
+#                  except:
+#                      return 0.0
+
+#              return 0.0
+
+#         total = parse_total(t1["total"])  # total game O/U
+
+#         #spread1 = parse_spread(t1["spread"])
+#         #spread2 = parse_spread(t2["spread"])
+#         spread1 = parse_spread(t1.get("spread", ""))
+#         spread2 = parse_spread(t2.get("spread", ""))
+
+#         # Compute Implied Team Totals
+#         # Formula: team_total = (total / 2) + (spread / 2)
+#         t1_total = (total / 2) + (spread1 / 2)
+#         t2_total = (total / 2) + (spread2 / 2)
+
+#         vegas[team1_name] = {
+#             "total": total,
+#             "spread": spread1,
+#             "team_total": t1_total
+#         }
+#         vegas[team2_name] = {
+#             "total": total,
+#             "spread": spread2,
+#             "team_total": t2_total
+#         }
+
+#     return vegas
+
+def vegas_multiplier(team, vegas):
+    team = normalize_team(team)
+    if not team or team not in vegas:
+        return 1.0  # default if not found
+
+    data = vegas[team]
+
+    total = data.get("total")
+    spread = data.get("spread")
+
+    mult = 1.0
+
+    # High total game → slight boost
+    if total:
+        mult *= max(0.9, min(1.10, (total - 215) / 100 + 1))
+
+    # Heavy favorite → more minutes, small boost
+    if spread is not None:
+        if spread < -5:      # favored
+            mult *= 1.02
+        elif spread > 5:     # underdog
+            mult *= 0.98
+
+    return mult
+
+# def vegas_multiplier(team_abbr: str, vegas: Dict[str, Dict[str, float]]) -> float:
+#     if not team_abbr:
+#         return 1.0
+#     data = vegas.get(team_abbr.upper(), {})
+#     total = float(data.get('total', VEGAS_DEFAULT_TOTAL))
+#     spread = float(data.get('spread', VEGAS_DEFAULT_SPREAD))
+#     total_adj = total / VEGAS_DEFAULT_TOTAL
+#     blowout_adj = 0.95 if spread <= -10 else 0.97 if spread >= 10 else 1.0
+#     mult = total_adj * blowout_adj
+#     return max(0.85, min(1.15, mult))
+
+def normalize_team(team):
+    if not team:
+        return None
+    t = team.strip().upper()
+    return TEAM_NAME_TO_ABBR.get(t, t)
 
 # -------------------------
 # Position-based usage context and redistribution
@@ -426,6 +553,27 @@ class SimpleNBAProjection:
         except Exception as e:
             print("⚠️ Error parsing team stats:", e)
             return False
+        
+    # def fetch_todays_matchups(self):
+    #     # So merge that into matchups
+    #     matchups = {}
+
+    #     for team, data in self.team_stats.items():
+    #         opp = data.get("opponent")
+    #         if not opp:
+    #             continue
+
+    #         pace = data.get("pace")
+    #         def_rating = data.get("def_rating")
+
+    #         matchups[team] = {
+    #             "opponent": opp,
+    #             "pace": pace,
+    #             "def_rating": def_rating
+    #         }
+    #         print(matchups)
+
+    #     self.todays_matchups = matchups
 
     def fetch_todays_matchups(self) -> bool:
         res = self._safe_api_call(scoreboardv2.ScoreboardV2)
@@ -525,16 +673,76 @@ class SimpleNBAProjection:
         recent = player_stats.get('recent_minutes', 0.0)
         projected = 0.4 * last5 + 0.25 * last10 + 0.35 * recent
         return float(max(0.0, min(48.0, projected)))
-
+    
+    
     def matchup_multiplier(self, team_abbr: str) -> float:
+        """
+        Adjust multiplier based on opponent's defense and pace.
+        More extreme values produce noticeable changes in projections.
+        """
+        #print(f"[DEBUG] matchup_multiplier called for {team_abbr}")
+        #print(f"[DEBUG] todays_matchups keys: {list(self.todays_matchups.keys())}")
         opp = self.todays_matchups.get(team_abbr, {}).get('opponent')
-        team_pace = self.team_stats.get(team_abbr, {}).get('pace', self.LEAGUE_AVG_PACE)
-        opp_pace = self.team_stats.get(opp, {}).get('pace', self.LEAGUE_AVG_PACE) if opp else self.LEAGUE_AVG_PACE
-        opp_def = self.team_stats.get(opp, {}).get('def_rating', 110.0) if opp else 110.0
+        #print(f"[DEBUG] No matchup found for {team_abbr}, returning 1.0")
+        if not opp:
+            return 1.0
+
+        team_stats = self.team_stats.get(team_abbr, {})
+        opp_stats = self.team_stats.get(opp, {})
+        #print(f"[DEBUG] team_stats: {team_stats}, opp_stats: {opp_stats}")
+
+        team_pace = team_stats.get('pace', self.LEAGUE_AVG_PACE)
+        opp_pace = opp_stats.get('pace', self.LEAGUE_AVG_PACE)
+        opp_def = opp_stats.get('def_rating', 110.0)
+
+        # Pace adjustment: how fast the game is vs league average
         pace_adj = ((team_pace + opp_pace) / 2.0) / self.LEAGUE_AVG_PACE
+
+        # Defensive adjustment: worse defense -> more points
         def_adj = 110.0 / float(opp_def)
-        multiplier = 0.5 * pace_adj + 0.5 * def_adj
-        return max(0.85, min(1.15, multiplier))
+
+        # Amplify the effect: instead of 50/50 blend, use weighted multiplication
+        multiplier = pace_adj ** 0.6 * def_adj ** 0.4
+
+        # Clamp to reasonable extremes
+        multiplier = max(0.85, min(1.20, multiplier))
+        #print(f"[DEBUG] {team_abbr} vs {opp}: pace_adj={pace_adj}, def_adj={def_adj}, multiplier={multiplier}")
+
+        # Debug print to verify
+        print(f"[DEBUG] {team_abbr} vs {opp}: pace_adj={pace_adj:.3f}, def_adj={def_adj:.3f}, multiplier={multiplier:.3f}")
+
+        return multiplier
+
+    # def matchup_multiplier(team, matchups) -> float:
+    #     team = normalize_team(team)
+    #     m = matchups.get(team)
+    #     if not m:
+    #         return 1.0
+
+    #     opp = normalize_team(m.get("opponent"))
+    #     pace = m.get("pace")
+    #     def_rating = m.get("def_rating")
+
+    #     mult = 1.0
+
+    #     if pace:
+    #         mult *= max(0.9, min(1.10, pace / 100))
+
+    #     if def_rating:
+    #         # Worse defense = more scoring
+    #         mult *= max(0.9, min(1.10, (110 - def_rating) / 100 + 1))
+
+    #     return mult
+
+    # def matchup_multiplier(self, team_abbr: str) -> float:
+    #     opp = self.todays_matchups.get(team_abbr, {}).get('opponent')
+    #     team_pace = self.team_stats.get(team_abbr, {}).get('pace', self.LEAGUE_AVG_PACE)
+    #     opp_pace = self.team_stats.get(opp, {}).get('pace', self.LEAGUE_AVG_PACE) if opp else self.LEAGUE_AVG_PACE
+    #     opp_def = self.team_stats.get(opp, {}).get('def_rating', 110.0) if opp else 110.0
+    #     pace_adj = ((team_pace + opp_pace) / 2.0) / self.LEAGUE_AVG_PACE
+    #     def_adj = 110.0 / float(opp_def)
+    #     multiplier = 0.5 * pace_adj + 0.5 * def_adj
+    #     return max(0.85, min(1.15, multiplier))
 
     def cap_projection_by_salary(self, projection: float, salary: float) -> float:
         cap = salary * 0.0068
@@ -594,10 +802,15 @@ class SimpleNBAProjection:
             if player_status:
                 base_min = apply_injury_minutes_adjustment(base_min, player_status)
             # dynamic usage redistribution based on team injuries & position
+            #team = normalize_team(row['Team'])
+            team = normalize_team(r['Team'])
+            #matchup_mult = self.matchup_multiplier(team, self.todays_matchups)
+            matchup_mult = self.matchup_multiplier(team) if team else 1.0
+            vegas_mult = vegas_multiplier(team, vegas)
             fpmin = dynamic_usage_redistribution(name, pos, fpmin, base_min, injuries, self.dk_df)
             # matchup & vegas multipliers
-            matchup_mult = self.matchup_multiplier(team) if team else 1.0
-            vegas_mult = vegas_multiplier(team, vegas) if team else 1.0
+            #matchup_mult = self.matchup_multiplier(team) if team else 1.0
+            #vegas_mult = vegas_multiplier(team, vegas) if team else 1.0
             mult = matchup_mult * vegas_mult
             raw_proj = fpmin * base_min * mult
             capped_proj = self.cap_projection_by_salary(raw_proj, salary)
