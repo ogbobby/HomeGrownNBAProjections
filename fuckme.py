@@ -74,6 +74,12 @@ TEAM_NAME_TO_ABBR = {
     "JAZZ": "UTA",
     "WIZARDS": "WAS"
 }
+
+VOLATILITY_MULTIPLIER = {
+    "HIGH": 1.25,
+    "MED": 1.0,
+    "LOW": 0.85
+}
 # -------------------------
 # Utility: CSV header mapping
 # -------------------------
@@ -204,86 +210,6 @@ def normalize_vegas_data(raw_games):
     return vegas
 
 
-# def normalize_vegas_data(raw_games):
-#     """
-#     Convert the new vegas format:
-#     [
-#       { 'team1': {...}, 'team2': {...}, 'matchup': 'Suns vs Thunder' },
-#       ...
-#     ]
-#     into a dictionary keyed by TEAM ABBREVIATION:
-#     {
-#         'SUNS': { 'spread': +14.5, 'total': 226.5, 'team_total': 110.3 },
-#         'THUNDER': { ... },
-#     }
-#     """
-#     vegas = {}
-
-#     for game in raw_games:
-#         t1 = game["team1"]
-#         t2 = game["team2"]
-
-#         # Extract teams
-#         team1_name = t1["team_name"].strip().upper()
-#         team2_name = t2["team_name"].strip().upper()
-
-#         # Extract O/U number (e.g., 'o226.5-110')
-#         def parse_total(val):
-#             # strip o/u prefix
-#             if val.startswith("o") or val.startswith("u"):
-#                 val = val[1:]
-#             # remove juice -110 etc.
-#             if "-" in val:
-#                 val = val.split("-")[0]
-#             return float(val)
-
-#         # Extract spread (e.g., '+14.5-110')
-#         def parse_spread(raw):
-#              """Parse spread strings like '+14.5-110', '-4.5 (-110)', 'PK', 'EVEN', etc."""
-#              if not raw or not isinstance(raw, str):
-#                  return 0.0  # safe fallback
-
-#              raw = raw.strip().lower()
-
-#              # Pure pick’em
-#              if raw in ("pk", "pick", "pick'em", "even"):
-#                  return 0.0
-
-#              # Extract the first float (spread value)
-#              m = re.search(r'([+-]?\d+\.?\d*)', raw)
-#              if m:
-#                  try:
-#                      return float(m.group(1))
-#                  except:
-#                      return 0.0
-
-#              return 0.0
-
-#         total = parse_total(t1["total"])  # total game O/U
-
-#         #spread1 = parse_spread(t1["spread"])
-#         #spread2 = parse_spread(t2["spread"])
-#         spread1 = parse_spread(t1.get("spread", ""))
-#         spread2 = parse_spread(t2.get("spread", ""))
-
-#         # Compute Implied Team Totals
-#         # Formula: team_total = (total / 2) + (spread / 2)
-#         t1_total = (total / 2) + (spread1 / 2)
-#         t2_total = (total / 2) + (spread2 / 2)
-
-#         vegas[team1_name] = {
-#             "total": total,
-#             "spread": spread1,
-#             "team_total": t1_total
-#         }
-#         vegas[team2_name] = {
-#             "total": total,
-#             "spread": spread2,
-#             "team_total": t2_total
-#         }
-
-#     return vegas
-
 def vegas_multiplier(team, vegas):
     team = normalize_team(team)
     if not team or team not in vegas:
@@ -309,22 +235,43 @@ def vegas_multiplier(team, vegas):
 
     return mult
 
-# def vegas_multiplier(team_abbr: str, vegas: Dict[str, Dict[str, float]]) -> float:
-#     if not team_abbr:
-#         return 1.0
-#     data = vegas.get(team_abbr.upper(), {})
-#     total = float(data.get('total', VEGAS_DEFAULT_TOTAL))
-#     spread = float(data.get('spread', VEGAS_DEFAULT_SPREAD))
-#     total_adj = total / VEGAS_DEFAULT_TOTAL
-#     blowout_adj = 0.95 if spread <= -10 else 0.97 if spread >= 10 else 1.0
-#     mult = total_adj * blowout_adj
-#     return max(0.85, min(1.15, mult))
-
 def normalize_team(team):
     if not team:
         return None
     t = team.strip().upper()
     return TEAM_NAME_TO_ABBR.get(t, t)
+
+def classify_volatility(fp_min_list):  #just added 12-16
+    if not fp_min_list or len(fp_min_list) < 5:
+        return "MED"
+
+    std = np.std(fp_min_list)
+    if std > 0.45:
+        return "HIGH"
+    elif std < 0.25:
+        return "LOW"
+    return "MED"
+
+def correlated_stat_draw(row, rng):   #just added 12-16
+    base = rng.normal(1.0, 0.12)
+
+    pts  = row.get('PTS', 0)  * rng.normal(base, 0.08)
+    ast  = row.get('AST', 0)  * rng.normal(base, 0.10)
+    reb  = row.get('REB', 0)  * rng.normal(1.0, 0.12)
+    fg3  = row.get('FG3M', 0) * rng.normal(base, 0.15)
+    stl  = row.get('STL', 0)  * rng.normal(1.0, 0.25)
+    blk  = row.get('BLK', 0)  * rng.normal(1.0, 0.25)
+    tov  = row.get('TOV', 0)  * rng.normal(1.0, 0.20)
+
+    return {
+        'PTS': max(0, pts),
+        'AST': max(0, ast),
+        'REB': max(0, reb),
+        'FG3M': max(0, fg3),
+        'STL': max(0, stl),
+        'BLK': max(0, blk),
+        'TOV': max(0, tov),
+    }
 
 # -------------------------
 # Position-based usage context and redistribution
@@ -444,35 +391,88 @@ def dynamic_usage_redistribution(player_name: str, player_pos: str, fpmin: float
 # -------------------------
 # Monte Carlo per-stat (for better floor/ceiling & variance)
 # -------------------------
-def monte_carlo_per_stat(player_logs: pd.DataFrame, n_sims: int = 2000, seed: int = 42) -> Dict[str, Dict[str, float]]:
-    """
-    For a player's recent logs (DataFrame), run Monte Carlo separately per stat and return:
-      { 'PTS': {'floor':..,'ceiling':..,'std':..}, ... }
-    Uses empirical sampling when >=6 samples, otherwise normal approx with truncation.
-    """
+def monte_carlo_per_stat(
+    player_logs: pd.DataFrame,
+    n_sims: int = 2000,
+    seed: int = 42
+) -> Dict[str, Dict[str, float]]:
+
+    if player_logs is None or player_logs.empty:
+        return {}
+
     rng = np.random.default_rng(seed)
     stat_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FG3M', 'TOV']
+
+    # Collect sims per stat
+    sims = {s: [] for s in stat_cols}
+
+    for _ in range(n_sims):
+        # 1️⃣ Sample a real game
+        row = player_logs.sample(1).iloc[0]
+
+        # 2️⃣ Correlated draw
+        base = rng.normal(1.0, 0.12)
+
+        draw = {
+            'PTS':  row.get('PTS', 0)  * rng.normal(base, 0.08),
+            'AST':  row.get('AST', 0)  * rng.normal(base, 0.10),
+            'REB':  row.get('REB', 0)  * rng.normal(1.0, 0.12),
+            'FG3M': row.get('FG3M', 0) * rng.normal(base, 0.15),
+            'STL':  row.get('STL', 0)  * rng.normal(1.0, 0.25),
+            'BLK':  row.get('BLK', 0)  * rng.normal(1.0, 0.25),
+            'TOV':  row.get('TOV', 0)  * rng.normal(1.0, 0.20),
+        }
+
+        # 3️⃣ Store results
+        for stat in stat_cols:
+            sims[stat].append(max(0.0, float(draw.get(stat, 0.0))))
+
+    # 4️⃣ Aggregate
     mc = {}
     for stat in stat_cols:
-        vals = []
-        if stat in player_logs.columns:
-            vals = [float(v) for v in player_logs[stat] if pd.notna(v)]
-        if len(vals) == 0:
+        arr = np.array(sims[stat])
+        if len(arr) == 0:
             mc[stat] = {'floor': 0.0, 'ceiling': 0.0, 'std': 0.0}
             continue
-        if len(vals) >= 6:
-            sims = rng.choice(vals, size=n_sims, replace=True)
-        else:
-            mu = float(np.mean(vals))
-            sigma = float(np.std(vals, ddof=1)) if len(vals) > 1 else max(0.1, mu * 0.2)
-            sims = rng.normal(mu, sigma, size=n_sims)
-            sims = np.clip(sims, 0.0, None)
+
         mc[stat] = {
-            'floor': float(np.percentile(sims, 20)),
-            'ceiling': float(np.percentile(sims, 90)),
-            'std': float(np.std(sims, ddof=1))
+            'floor': float(np.percentile(arr, 20)),
+            'ceiling': float(np.percentile(arr, 90)),
+            'std': float(np.std(arr, ddof=1))
         }
+
     return mc
+
+# def monte_carlo_per_stat(player_logs: pd.DataFrame, n_sims: int = 2000, seed: int = 42) -> Dict[str, Dict[str, float]]:
+#     """
+#     For a player's recent logs (DataFrame), run Monte Carlo separately per stat and return:
+#       { 'PTS': {'floor':..,'ceiling':..,'std':..}, ... }
+#     Uses empirical sampling when >=6 samples, otherwise normal approx with truncation.
+#     """
+#     rng = np.random.default_rng(seed)
+#     stat_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FG3M', 'TOV']
+#     mc = {}
+#     for stat in stat_cols:
+#         vals = []
+#         if stat in player_logs.columns:
+#             vals = [float(v) for v in player_logs[stat] if pd.notna(v)]
+#         if len(vals) == 0:
+#             mc[stat] = {'floor': 0.0, 'ceiling': 0.0, 'std': 0.0}
+#             continue
+#         if len(vals) >= 6:
+#             sims = rng.choice(vals, size=n_sims, replace=True)
+#         else:
+#             mu = float(np.mean(vals))
+#             sigma = float(np.std(vals, ddof=1)) if len(vals) > 1 else max(0.1, mu * 0.2)
+#             sims = rng.normal(mu, sigma, size=n_sims)
+#             sims = np.clip(sims, 0.0, None)
+#         mc[stat] = {
+#             'floor': float(np.percentile(sims, 20)),
+#             'ceiling': float(np.percentile(sims, 90)),
+#             'std': float(np.std(sims, ddof=1))
+            
+#         }
+#     return mc
 
 # -------------------------
 # Core projection class
@@ -554,27 +554,6 @@ class SimpleNBAProjection:
             print("⚠️ Error parsing team stats:", e)
             return False
         
-    # def fetch_todays_matchups(self):
-    #     # So merge that into matchups
-    #     matchups = {}
-
-    #     for team, data in self.team_stats.items():
-    #         opp = data.get("opponent")
-    #         if not opp:
-    #             continue
-
-    #         pace = data.get("pace")
-    #         def_rating = data.get("def_rating")
-
-    #         matchups[team] = {
-    #             "opponent": opp,
-    #             "pace": pace,
-    #             "def_rating": def_rating
-    #         }
-    #         print(matchups)
-
-    #     self.todays_matchups = matchups
-
     def fetch_todays_matchups(self) -> bool:
         res = self._safe_api_call(scoreboardv2.ScoreboardV2)
         if res is None:
@@ -713,37 +692,6 @@ class SimpleNBAProjection:
 
         return multiplier
 
-    # def matchup_multiplier(team, matchups) -> float:
-    #     team = normalize_team(team)
-    #     m = matchups.get(team)
-    #     if not m:
-    #         return 1.0
-
-    #     opp = normalize_team(m.get("opponent"))
-    #     pace = m.get("pace")
-    #     def_rating = m.get("def_rating")
-
-    #     mult = 1.0
-
-    #     if pace:
-    #         mult *= max(0.9, min(1.10, pace / 100))
-
-    #     if def_rating:
-    #         # Worse defense = more scoring
-    #         mult *= max(0.9, min(1.10, (110 - def_rating) / 100 + 1))
-
-    #     return mult
-
-    # def matchup_multiplier(self, team_abbr: str) -> float:
-    #     opp = self.todays_matchups.get(team_abbr, {}).get('opponent')
-    #     team_pace = self.team_stats.get(team_abbr, {}).get('pace', self.LEAGUE_AVG_PACE)
-    #     opp_pace = self.team_stats.get(opp, {}).get('pace', self.LEAGUE_AVG_PACE) if opp else self.LEAGUE_AVG_PACE
-    #     opp_def = self.team_stats.get(opp, {}).get('def_rating', 110.0) if opp else 110.0
-    #     pace_adj = ((team_pace + opp_pace) / 2.0) / self.LEAGUE_AVG_PACE
-    #     def_adj = 110.0 / float(opp_def)
-    #     multiplier = 0.5 * pace_adj + 0.5 * def_adj
-    #     return max(0.85, min(1.15, multiplier))
-
     def cap_projection_by_salary(self, projection: float, salary: float) -> float:
         cap = salary * 0.0068
         return min(projection, cap)
@@ -811,6 +759,8 @@ class SimpleNBAProjection:
             #raw_proj = fpmin * base_min * mult ###Old line THis is to change rawprojection so it show projection before adding multiplier
             raw_proj = fpmin * base_min
             proj_with_mult = raw_proj * mult
+            fp_min_list = stats.get('fp_min_list', [])  #added 12-16
+            vol_tier = classify_volatility(fp_min_list)     #added 12-16
             #capped_proj = self.cap_projection_by_salary(raw_proj, salary) ###old line THis is to change rawprojection so it show projection before adding multiplier
             capped_proj = self.cap_projection_by_salary(proj_with_mult, salary)
             # Monte Carlo per-minute floor/ceiling: use empirical fp_min_list and min_list
@@ -828,6 +778,17 @@ class SimpleNBAProjection:
             ceiling = max(mc_simple['ceiling'] * 0.5 + ceil_stat * 0.5, 0.0)
             volatility = mc_simple.get('volatility_std', 0.0)
             mc_mean = mc_simple.get('mean', fpmin * base_min)
+            mean_proj = capped_proj                 #added 12-16
+            std = volatility                    #added 12-16
+            vol_tier = classify_volatility(stats.get('fp_min_list', []))       #added 12-16
+            sims = mc_simple.get('sims', np.array([]))    #added 12-16
+
+
+            p_6x = float(np.mean(sims >= salary * 0.006)) if sims.size else 0.0     #added 12-16
+            p_8x = float(np.mean(sims >= salary * 0.008)) if sims.size else 0.0     #added 12-16
+
+            leverage_score = (ceiling - mean_proj) / max(1.0, std)          #added 12-16
+
 
             results.append({
                 'Name': name,
@@ -842,10 +803,15 @@ class SimpleNBAProjection:
                 'Multiplier': round(mult, 3),
                 'InjuryStatus': player_status or 'None',
                 'Games': stats.get('games', 0),
+                'VolatilityTier': vol_tier,                 #just added 12-16
+                'BoomScore': round(leverage_score, 2),         #just added 12-16
+                'CashScore': round(mean_proj / max(1.0, std), 2),       #added 12-16
                 'Floor_MC': round(floor, 1),
                 'Ceiling_MC': round(ceiling, 1),
                 'Volatility_STD': round(volatility, 2),
-                'MC_Mean': round(mc_mean, 1)
+                'MC_Mean': round(mc_mean, 1),
+                'P_6x': round(p_6x, 3),             #added 12-16
+                'P_8x': round(p_8x, 3)              #added 12-16
             })
 
         out_df = pd.DataFrame(results).sort_values('Projection', ascending=False)
@@ -871,6 +837,8 @@ class SimpleNBAProjection:
 
         fp_vals = np.array([v for v in fp_min_list if np.isfinite(v) and v > 0])
         min_vals = np.array([m for m in min_list if np.isfinite(m) and m > 0])
+        vol_tier = classify_volatility(fp_min_list) #just added 12-16
+        vol_mult = VOLATILITY_MULTIPLIER.get(vol_tier, 1.0) #just added 12-16
 
         if len(fp_vals) == 0 or len(min_vals) == 0:
             return {'floor': 0.0, 'ceiling': 0.0, 'volatility_std': 0.0}
@@ -889,6 +857,7 @@ class SimpleNBAProjection:
         for _ in range(n_sims):
             fp_per_min = rng.choice(fp_vals)
             minutes = rng.choice(min_vals)
+            fp_per_min *= rng.normal(1.0, 0.08 * vol_mult) #just added 12-16
 
             # --- 2. Skewed upside noise using lognormal ------
             noise = rng.lognormal(mean=0, sigma=noise_pct)
@@ -900,40 +869,9 @@ class SimpleNBAProjection:
         return {
             'floor': float(np.percentile(sims, 20)),
             'ceiling': float(np.percentile(sims, 90)),
-            'volatility_std': float(np.std(sims, ddof=1))
-        }
-    
-    # def monte_carlo(self, fp_min_list: List[float], min_list: List[float], matchup_mult: float, vegas_mult: float, n_sims: int = 2000, noise_pct: float = 0.05) -> Dict[str, float]:
-    #     """
-    #     Monte Carlo sampling with empirical fp/min and minutes arrays,
-    #     applying matchup and Vegas multipliers plus small random noise.
-
-    #     - noise_pct: ±fractional noise added to multiplier per simulation
-    #     """
-    #     fp_vals = np.array([v for v in fp_min_list if np.isfinite(v) and v > 0])
-    #     min_vals = np.array([m for m in min_list if np.isfinite(m) and m > 0])
-    #     if len(fp_vals) == 0 or len(min_vals) == 0:
-    #         return {'floor': 0.0, 'ceiling': 0.0, 'volatility_std': 0.0}
-
-    #     rng = np.random.default_rng(42)
-    #     sims = []
-    #     for _ in range(n_sims):
-    #         fp_per_min = rng.choice(fp_vals)
-    #         minutes = rng.choice(min_vals)
-
-    #         # Base multiplier
-    #         base_mult = matchup_mult * vegas_mult
-
-    #         # Add ±noise_pct random variation
-    #         noise = 1.0 + rng.uniform(-noise_pct, noise_pct)
-    #         sims.append(fp_per_min * minutes * base_mult * noise)
-
-    #     sims = np.array(sims)
-    #     return {
-    #         'floor': float(np.percentile(sims, 20)),
-    #         'ceiling': float(np.percentile(sims, 90)),
-    #         'volatility_std': float(np.std(sims, ddof=1))
-    #     }
+            'volatility_std': float(np.std(sims, ddof=1)),
+            'sims': sims     #added 12-16  
+              }
 
 # -------------------------
 # Top-level helper for CLI
