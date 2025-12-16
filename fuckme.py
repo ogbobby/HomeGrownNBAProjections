@@ -802,22 +802,21 @@ class SimpleNBAProjection:
             if player_status:
                 base_min = apply_injury_minutes_adjustment(base_min, player_status)
             # dynamic usage redistribution based on team injuries & position
-            #team = normalize_team(row['Team'])
             team = normalize_team(r['Team'])
-            #matchup_mult = self.matchup_multiplier(team, self.todays_matchups)
             matchup_mult = self.matchup_multiplier(team) if team else 1.0
             vegas_mult = vegas_multiplier(team, vegas)
             fpmin = dynamic_usage_redistribution(name, pos, fpmin, base_min, injuries, self.dk_df)
             # matchup & vegas multipliers
-            #matchup_mult = self.matchup_multiplier(team) if team else 1.0
-            #vegas_mult = vegas_multiplier(team, vegas) if team else 1.0
             mult = matchup_mult * vegas_mult
-            raw_proj = fpmin * base_min * mult
-            capped_proj = self.cap_projection_by_salary(raw_proj, salary)
+            #raw_proj = fpmin * base_min * mult ###Old line THis is to change rawprojection so it show projection before adding multiplier
+            raw_proj = fpmin * base_min
+            proj_with_mult = raw_proj * mult
+            #capped_proj = self.cap_projection_by_salary(raw_proj, salary) ###old line THis is to change rawprojection so it show projection before adding multiplier
+            capped_proj = self.cap_projection_by_salary(proj_with_mult, salary)
             # Monte Carlo per-minute floor/ceiling: use empirical fp_min_list and min_list
             mc_simple = self.monte_carlo(fp_min_list=stats.get('fp_min_list', []),
                                          min_list=stats.get('min_list', []),
-                                         matchup_mult=matchup_mult, vegas_mult=vegas_mult, n_sims=n_sims)
+                                         matchup_mult=matchup_mult, projected_minutes=base_min, vegas_mult=vegas_mult, n_sims=n_sims)
             # Monte Carlo per-stat for floor/ceiling derivation (optional, expensive)
             per_stat_mc = monte_carlo_per_stat(stats.get('logs_df', pd.DataFrame()), n_sims=n_sims)
             # Convert per-stat floors/ceilings to DK FP floor/ceiling with scoring weights
@@ -828,6 +827,7 @@ class SimpleNBAProjection:
             floor = max(mc_simple['floor'] * 0.5 + floor_stat * 0.5, 0.0)
             ceiling = max(mc_simple['ceiling'] * 0.5 + ceil_stat * 0.5, 0.0)
             volatility = mc_simple.get('volatility_std', 0.0)
+            mc_mean = mc_simple.get('mean', fpmin * base_min)
 
             results.append({
                 'Name': name,
@@ -844,7 +844,8 @@ class SimpleNBAProjection:
                 'Games': stats.get('games', 0),
                 'Floor_MC': round(floor, 1),
                 'Ceiling_MC': round(ceiling, 1),
-                'Volatility_STD': round(volatility, 2)
+                'Volatility_STD': round(volatility, 2),
+                'MC_Mean': round(mc_mean, 1)
             })
 
         out_df = pd.DataFrame(results).sort_values('Projection', ascending=False)
@@ -852,23 +853,87 @@ class SimpleNBAProjection:
             out_df.to_csv(save_csv, index=False)
             print(f"✅ Saved projections to {save_csv}")
         return out_df
+    
+    def monte_carlo(
+        self,
+        fp_min_list,
+        min_list,
+        matchup_mult,
+        vegas_mult,
+        projected_minutes,
+        n_sims=2000
+    ):
+        """
+        Monte Carlo with:
+          1. Role-based noise scaling
+          2. Skewed lognormal randomness (heavy upside)
+        """
 
-    def monte_carlo(self, fp_min_list: List[float], min_list: List[float], matchup_mult: float, vegas_mult: float, n_sims: int = 2000) -> Dict[str, float]:
-        """
-        Simple Monte Carlo sampling using empirical fp/min and minutes arrays.
-        """
         fp_vals = np.array([v for v in fp_min_list if np.isfinite(v) and v > 0])
         min_vals = np.array([m for m in min_list if np.isfinite(m) and m > 0])
+
         if len(fp_vals) == 0 or len(min_vals) == 0:
             return {'floor': 0.0, 'ceiling': 0.0, 'volatility_std': 0.0}
+
+        # --- 1. Determine noise level by role -------
+        if projected_minutes > 34:
+            noise_pct = 0.03   # superstars
+        elif projected_minutes > 28:
+            noise_pct = 0.05   # safe starters
+        else:
+            noise_pct = 0.10   # bench / volatile
+
         rng = np.random.default_rng(42)
         sims = []
+
         for _ in range(n_sims):
             fp_per_min = rng.choice(fp_vals)
             minutes = rng.choice(min_vals)
-            sims.append(fp_per_min * minutes * matchup_mult * vegas_mult)
+
+            # --- 2. Skewed upside noise using lognormal ------
+            noise = rng.lognormal(mean=0, sigma=noise_pct)
+
+            sims.append(fp_per_min * minutes * matchup_mult * vegas_mult * noise)
+
         sims = np.array(sims)
-        return {'floor': float(np.percentile(sims, 20)), 'ceiling': float(np.percentile(sims, 90)), 'volatility_std': float(np.std(sims, ddof=1))}
+
+        return {
+            'floor': float(np.percentile(sims, 20)),
+            'ceiling': float(np.percentile(sims, 90)),
+            'volatility_std': float(np.std(sims, ddof=1))
+        }
+    
+    # def monte_carlo(self, fp_min_list: List[float], min_list: List[float], matchup_mult: float, vegas_mult: float, n_sims: int = 2000, noise_pct: float = 0.05) -> Dict[str, float]:
+    #     """
+    #     Monte Carlo sampling with empirical fp/min and minutes arrays,
+    #     applying matchup and Vegas multipliers plus small random noise.
+
+    #     - noise_pct: ±fractional noise added to multiplier per simulation
+    #     """
+    #     fp_vals = np.array([v for v in fp_min_list if np.isfinite(v) and v > 0])
+    #     min_vals = np.array([m for m in min_list if np.isfinite(m) and m > 0])
+    #     if len(fp_vals) == 0 or len(min_vals) == 0:
+    #         return {'floor': 0.0, 'ceiling': 0.0, 'volatility_std': 0.0}
+
+    #     rng = np.random.default_rng(42)
+    #     sims = []
+    #     for _ in range(n_sims):
+    #         fp_per_min = rng.choice(fp_vals)
+    #         minutes = rng.choice(min_vals)
+
+    #         # Base multiplier
+    #         base_mult = matchup_mult * vegas_mult
+
+    #         # Add ±noise_pct random variation
+    #         noise = 1.0 + rng.uniform(-noise_pct, noise_pct)
+    #         sims.append(fp_per_min * minutes * base_mult * noise)
+
+    #     sims = np.array(sims)
+    #     return {
+    #         'floor': float(np.percentile(sims, 20)),
+    #         'ceiling': float(np.percentile(sims, 90)),
+    #         'volatility_std': float(np.std(sims, ddof=1))
+    #     }
 
 # -------------------------
 # Top-level helper for CLI
