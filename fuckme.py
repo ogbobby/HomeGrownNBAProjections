@@ -62,7 +62,7 @@ TEAM_NAME_TO_ABBR = {
     "BUCKS": "MIL",
     "TIMBERWOLVES": "MIN",
     "PELICANS": "NOP",
-    "NEW KNICKS": "NYK",
+    "KNICKS": "NYK",
     "THUNDER": "OKC",
     "MAGIC": "ORL",
     "76ERS": "PHI",
@@ -156,23 +156,64 @@ def normalize_vegas_data(raw_games):
         team2_full = t2["team_name"].strip().upper()
         team1_abbr = TEAM_NAME_TO_ABBR.get(team1_full)
         team2_abbr = TEAM_NAME_TO_ABBR.get(team2_full)
+         # 🚫 Skip postponed / NA games
+        if not t1.get("total") or not t2.get("total"):
+            print(f"⚠️ Skipping postponed game: {game.get('matchup')}")
+            continue
+
 
         if not team1_abbr or not team2_abbr:
             print(f"⚠️ Could not normalize teams: {team1_full}, {team2_full}")
             continue
 
         # Extract total game O/U
+        # def parse_total(val):
+        #     if val.startswith("o") or val.startswith("u"):
+        #         val = val[1:]
+        #     if "-" in val:
+        #         val = val.split("-")[0]
+        #     try:
+        #         return float(val)
+        #     except:
+        #         return 0.0
+
         def parse_total(val):
-            if val.startswith("o") or val.startswith("u"):
+            """
+            Parse totals like:
+              'o226.5-110'
+              'u230'
+              '226.5'
+              None
+            """
+            if val is None:
+                return None
+
+            # If already numeric
+            if isinstance(val, (int, float)):
+                return float(val)
+
+            if not isinstance(val, str):
+                return None
+
+            val = val.strip().lower()
+            if not val:
+                return None
+
+            # Strip o/u
+            if val.startswith(("o", "u")):
                 val = val[1:]
+
+            # Strip juice
             if "-" in val:
                 val = val.split("-")[0]
+
             try:
                 return float(val)
-            except:
-                return 0.0
+            except ValueError:
+                return None
 
-        total = parse_total(t1.get("total", 0))
+        #total = parse_total(t1.get("total", 0))
+        total = parse_total(t1.get("total"))
 
         # Extract spread
         def parse_spread(raw):
@@ -272,6 +313,39 @@ def correlated_stat_draw(row, rng):   #just added 12-16
         'BLK': max(0, blk),
         'TOV': max(0, tov),
     }
+def estimate_ownership(df):                     #Function added 12-16
+    """
+    Estimate ownership % using salary and projection ranks.
+    Output is roughly calibrated to DK large-field GPPs.
+    """
+    df = df.copy()
+
+    df['SalRank'] = df['Salary'].rank(pct=True)
+    df['ProjRank'] = df['Projection'].rank(pct=True)
+
+    # Core ownership signal
+    raw = (
+        0.65 * df['ProjRank'] +
+        0.35 * df['SalRank']
+    )
+
+    # Nonlinear squashing
+    df['Ownership'] = (
+        100 * np.clip(raw ** 1.8, 0.01, 0.65)
+    )
+
+    return df
+
+def salary_bias(salary):
+    if salary < 4000:
+        return -0.5
+    if 4000 <= salary <= 5200:
+        return 1.0
+    if 5200 < salary <= 6800:
+        return -0.3
+    if 6800 < salary <= 8500:
+        return 0.6
+    return 0.3  # expensive stars
 
 # -------------------------
 # Position-based usage context and redistribution
@@ -688,7 +762,7 @@ class SimpleNBAProjection:
         #print(f"[DEBUG] {team_abbr} vs {opp}: pace_adj={pace_adj}, def_adj={def_adj}, multiplier={multiplier}")
 
         # Debug print to verify
-        print(f"[DEBUG] {team_abbr} vs {opp}: pace_adj={pace_adj:.3f}, def_adj={def_adj:.3f}, multiplier={multiplier:.3f}")
+        #print(f"[DEBUG] {team_abbr} vs {opp}: pace_adj={pace_adj:.3f}, def_adj={def_adj:.3f}, multiplier={multiplier:.3f}")
 
         return multiplier
 
@@ -815,9 +889,125 @@ class SimpleNBAProjection:
             })
 
         out_df = pd.DataFrame(results).sort_values('Projection', ascending=False)
+        out_df = estimate_ownership(out_df) #added 12-16
+        #out_df = pd.DataFrame(results).sort_values('Projection', ascending=False)
+        out_df.fillna(0.0, inplace=True)
+
+        # ------------------------
+        # Z-score helpers (FIRST)
+        # ------------------------
+        def zscore(s):
+            std = s.std(ddof=0)
+            if std == 0 or not np.isfinite(std):
+                return pd.Series(0.0, index=s.index)
+            return (s - s.mean()) / std
+
+        out_df['z_proj'] = zscore(out_df['Projection'])
+        out_df['z_value'] = zscore(out_df['Projection'] / out_df['Salary'])
+        out_df['z_minutes'] = zscore(out_df['ProjMin'])
+        out_df['z_ceil'] = zscore(out_df['Ceiling_MC'])
+
+        # ------------------------
+        # Ownership estimation
+        # ------------------------
+        #out_df = estimate_ownership(out_df)
+
+        out_df['SalaryBias'] = out_df['Salary'].apply(salary_bias)
+
+        #out_df['OwnershipScore'] = (
+        #    0.35 * out_df['z_value'] +
+        #    0.25 * out_df['z_minutes'] +
+        #    0.20 * out_df['z_proj'] +
+        #    0.15 * out_df['z_ceil'] +
+        #    0.05 * out_df['SalaryBias']
+        #)
+        out_df['OwnershipScore_Cash'] = (
+            0.40 * out_df['z_value'] +
+            0.30 * out_df['z_minutes'] +
+            0.20 * out_df['z_proj'] +
+            0.10 * (-out_df['Volatility_STD'])
+        )
+
+        out_df['OwnershipScore_GPP'] = (
+            0.30 * out_df['z_proj'] +
+            0.30 * out_df['z_ceil'] +
+            0.15 * out_df['SalaryBias'] +
+            0.15 * out_df['BoomScore'] +
+            0.10 * out_df['z_minutes']
+        )
+
+        #exp = np.exp(out_df['OwnershipScore'] - out_df['OwnershipScore'].max())
+        #out_df['Ownership'] = 100 * exp / exp.sum()
+        #out_df['OwnershipPct'] = 100 * exp / exp.sum()          #added 12-17
+        #out_df['OwnershipPct'] = 100 * out_df['OwnershipProb']
+        #out_df['OwnershipPct'] = np.clip(out_df['OwnershipPct'], 0.5, 40)
+        #out_df['OwnershipPct'] *= 100 / out_df['OwnershipPct'].sum()
+        #out_df['OwnershipProb'] = out_df['OwnershipPct'] / 100.0
+        # Step 1: raw OwnershipScore → probabilities
+        #exp = np.exp(out_df['OwnershipScore'] - out_df['OwnershipScore'].max())
+        #out_df['OwnershipProb'] = exp / exp.sum()  # fraction 0-1, sums to 1
+        exp = np.exp(out_df['OwnershipScore_GPP'] - out_df['OwnershipScore_GPP'].max())
+        out_df['OwnershipProb'] = exp / exp.sum()
+        out_df['OwnershipPct'] = 100 * out_df['OwnershipProb']
+
+        # Step 2: human-readable percentages
+        out_df['OwnershipPct'] = 100 * out_df['OwnershipProb']
+
+        # Step 3: optional: clip extremes
+        out_df['OwnershipPct'] = np.clip(out_df['OwnershipPct'], 0.5, 40)
+
+        # Step 4: renormalize so percentages sum to ~100
+        out_df['OwnershipPct'] *= 100 / out_df['OwnershipPct'].sum()
+
+        # Step 5: update probabilities to match clipped/renormalized percentages
+        out_df['OwnershipProb'] = out_df['OwnershipPct'] / 100.0
+
+        # Optional display column for human-readable output
+        out_df['OwnershipPctDisplay'] = out_df['OwnershipPct'].apply(lambda x: f"{x:.1f}%")
+
+        pos_counts = out_df['Position'].value_counts()
+        
+        out_df['PosScarcity'] = out_df['Position'].map(
+            lambda p: 1.0 / pos_counts.get(p, 1)
+        )
+
+        out_df['OwnershipPct'] *= (1 + 0.12 * out_df['PosScarcity'])
+        out_df['SalaryCluster'] = (out_df['Salary'] % 1000 == 0).astype(int)
+        out_df['OwnershipPct'] *= (1 + 0.05 * out_df['SalaryCluster'])
+        proj_rank = out_df['Projection'].rank(pct=True)
+        out_df['CliffBoost'] = (proj_rank > 0.90).astype(int)
+
+        out_df['OwnershipPct'] *= (1 + 0.15 * out_df['CliffBoost'])
+        out_df['OwnershipPct'] *= 100.0 / out_df['OwnershipPct'].sum()
+        out_df['OwnershipProb'] = out_df['OwnershipPct'] / 100.0
+
+
+        def softmax_pct(s):
+            exp = np.exp(s - s.max())
+            return 100 * exp / exp.sum()
+
+        out_df['CashOwnershipPct'] = softmax_pct(out_df['OwnershipScore_Cash'])
+        out_df['GPPOwnershipPct']  = softmax_pct(out_df['OwnershipScore_GPP'])
+        # ------------------------
+        # GPP / leverage metrics
+        # ------------------------
+        #out_df['Leverage'] = (
+        #    #out_df['P_8x'] * 100 / np.clip(out_df['Ownership'], 1.0, None)
+        #    out_df['P_8x'] / np.clip(out_df['OwnershipProb'], 0.01, None) #added 12-17
+        #)
+        out_df['Leverage'] = (
+            out_df['P_8x'] / np.clip(out_df['OwnershipProb'], 1e-4, None)
+        )
+
+
+        #out_df['ChalkRisk'] = (
+        #    #out_df['Ownership'] * (1.0 - out_df['P_6x'])
+        #    out_df['OwnershipProb'] * (1.0 - out_df['P_6x'])    #added 12-17
+        #)
+        out_df['ChalkRisk'] = out_df['OwnershipProb'] * (1.0 - out_df['P_6x'])
         if save_csv:
-            out_df.to_csv(save_csv, index=False)
-            print(f"✅ Saved projections to {save_csv}")
+             out_df.to_csv(save_csv, index=False)
+             print(f"✅ Saved projections to {save_csv}")
         return out_df
     
     def monte_carlo(
