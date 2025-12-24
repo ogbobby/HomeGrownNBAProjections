@@ -85,6 +85,80 @@ bust_rate = (
 
 print(bust_rate)
 
+# ---------------------------
+# Boom score
+# ---------------------------
+df['BoomRank'] = df['BoomScore'].rank(pct=True)
+
+boom_test = (
+    df.groupby(pd.qcut(df['BoomRank'], 5))
+      .agg(
+          MeanFPTS=('FPTS', 'mean'),
+          P90=('FPTS', lambda x: x.quantile(0.9)),
+          P95=('FPTS', lambda x: x.quantile(0.95)),
+          Hit8x=('P_8x', 'mean')
+      )
+)
+
+print(boom_test)
+
+# -----------------------------
+# GPP Alpha
+# -----------------------------
+df['AlphaRank'] = df['GPP_Alpha'].rank(pct=True)
+
+alpha_test = (
+    df.groupby(pd.qcut(df['AlphaRank'], 5))
+      .agg(
+          MeanFPTS=('FPTS', 'mean'),
+          Ownership=('OwnershipPct', 'mean'),
+          P90=('FPTS', lambda x: x.quantile(0.9)),
+          P95=('FPTS', lambda x: x.quantile(0.95))
+      )
+)
+
+print(alpha_test)
+
+# -----------------------------
+# Ownership(Spearman)
+# -----------------------------
+own_corr = spearmanr(
+    df['OwnershipPct'],
+    dk.groupby('Player')['EntryId'].count().reindex(df['Name']).fillna(0)
+)[0]
+
+print("Ownership Spearman:", own_corr)
+
+# -------------------------------
+# Chalk Risk
+# -------------------------------
+df['Failed'] = df['FPTS'] < df['Projection']
+
+chalk_test = (
+    df.groupby(pd.qcut(df['ChalkRisk'], 5))
+      .agg(
+          BustRate=('Failed', 'mean'),
+          MeanFPTS=('FPTS', 'mean')
+      )
+)
+
+print(chalk_test)
+
+# -------------------------------
+# GPP Tier Sanity check
+# -------------------------------
+tier_test = (
+    df.groupby('GPP_Tier')
+      .agg(
+          MeanFPTS=('FPTS', 'mean'),
+          P90=('FPTS', lambda x: x.quantile(0.9)),
+          Ownership=('OwnershipPct', 'mean')
+      )
+)
+
+print(tier_test)
+
+
 # ----------------------------
 # Value correlation
 # ----------------------------
