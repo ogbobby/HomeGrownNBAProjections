@@ -80,6 +80,7 @@ VOLATILITY_MULTIPLIER = {
     "MED": 1.0,
     "LOW": 0.85
 }
+BIAS_CORRECTION = 1.045
 # -------------------------
 # Utility: CSV header mapping
 # -------------------------
@@ -165,17 +166,6 @@ def normalize_vegas_data(raw_games):
         if not team1_abbr or not team2_abbr:
             print(f"⚠️ Could not normalize teams: {team1_full}, {team2_full}")
             continue
-
-        # Extract total game O/U
-        # def parse_total(val):
-        #     if val.startswith("o") or val.startswith("u"):
-        #         val = val[1:]
-        #     if "-" in val:
-        #         val = val.split("-")[0]
-        #     try:
-        #         return float(val)
-        #     except:
-        #         return 0.0
 
         def parse_total(val):
             """
@@ -357,9 +347,6 @@ def compute_position_usage_context(team_players_df: pd.DataFrame, injuries: Dict
     """
     ctx = {"usg_missing": 0.0, "ast_missing": 0.0, "reb_missing": 0.0, "pg_out": False, "c_out": False, "positions_out": []}
     for _, p in team_players_df.iterrows():
-        #name = str(p.get("Name", "")).strip().lower().apply(normalize_name)
-        #pos = str(p.get("Position", "")).strip()
-        #status = injuries.get(name)
         name = normalize_name(p.get("Name",""))
         pos = str(p.get("Position",""))
         status = injuries.get(name)
@@ -396,7 +383,6 @@ def dynamic_usage_redistribution(player_name: str, player_pos: str, fpmin: float
     injuries_l = {normalize_name(k):v for k,v in injuries.items()}
     team = None
     # find player's team in dk_df
-    #row = dk_df[dk_df['Name'].str.strip().str.lower() == player_name.strip().lower()]
     row = dk_df[dk_df['Name'].apply(normalize_name) == normalize_name(player_name)]
     if not row.empty:
         team = row.iloc[0].get('Team')
@@ -408,13 +394,11 @@ def dynamic_usage_redistribution(player_name: str, player_pos: str, fpmin: float
     ctx = compute_position_usage_context(team_players_df, injuries_l)
 
     boost = 0.0
-    #name_l = player_name.strip().lower()
     name_l = normalize_name(player_name)
 
     # 1) Direct backup: same-position starter out (and not the player itself)
     same_pos_out = any(
         (injuries_l.get(normalize_name(p))=="out") and (pos==player_pos)
-        #(injuries_l.get(p.strip().lower()) == 'OUT') and (pos == player_pos)
         for p, pos in zip(team_players_df['Name'], team_players_df.get('Position', pd.Series(['']*len(team_players_df))))
     )
     if same_pos_out and injuries_l.get(name_l) != 'OUT':
@@ -516,37 +500,6 @@ def monte_carlo_per_stat(
         }
 
     return mc
-
-# def monte_carlo_per_stat(player_logs: pd.DataFrame, n_sims: int = 2000, seed: int = 42) -> Dict[str, Dict[str, float]]:
-#     """
-#     For a player's recent logs (DataFrame), run Monte Carlo separately per stat and return:
-#       { 'PTS': {'floor':..,'ceiling':..,'std':..}, ... }
-#     Uses empirical sampling when >=6 samples, otherwise normal approx with truncation.
-#     """
-#     rng = np.random.default_rng(seed)
-#     stat_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FG3M', 'TOV']
-#     mc = {}
-#     for stat in stat_cols:
-#         vals = []
-#         if stat in player_logs.columns:
-#             vals = [float(v) for v in player_logs[stat] if pd.notna(v)]
-#         if len(vals) == 0:
-#             mc[stat] = {'floor': 0.0, 'ceiling': 0.0, 'std': 0.0}
-#             continue
-#         if len(vals) >= 6:
-#             sims = rng.choice(vals, size=n_sims, replace=True)
-#         else:
-#             mu = float(np.mean(vals))
-#             sigma = float(np.std(vals, ddof=1)) if len(vals) > 1 else max(0.1, mu * 0.2)
-#             sims = rng.normal(mu, sigma, size=n_sims)
-#             sims = np.clip(sims, 0.0, None)
-#         mc[stat] = {
-#             'floor': float(np.percentile(sims, 20)),
-#             'ceiling': float(np.percentile(sims, 90)),
-#             'std': float(np.std(sims, ddof=1))
-            
-#         }
-#     return mc
 
 # -------------------------
 # Core projection class
@@ -801,7 +754,6 @@ class SimpleNBAProjection:
         results = []
         for _, r in self.dk_df.iterrows():
             name = r['Name'].strip()
-            #name_l = name.lower()
             name_l = normalize_name(name)
             salary = float(r['Salary'])
             team = r.get('Team', None)
@@ -847,9 +799,14 @@ class SimpleNBAProjection:
             stat_weights = {'PTS': 1.0, 'REB': 1.2, 'AST': 1.5, 'STL': 3.0, 'BLK': 3.0, 'FG3M': 0.5, 'TOV': -1.0}
             floor_stat = sum(per_stat_mc[s]['floor'] * stat_weights.get(s, 0.0) for s in per_stat_mc)
             ceil_stat = sum(per_stat_mc[s]['ceiling'] * stat_weights.get(s, 0.0) for s in per_stat_mc)
-            # Combine simple MC and stat MC: prefer stat-driven floor/ceiling if available
-            floor = max(mc_simple['floor'] * 0.5 + floor_stat * 0.5, 0.0)
-            ceiling = max(mc_simple['ceiling'] * 0.5 + ceil_stat * 0.5, 0.0)
+            floor = max(
+                0.65 * mc_simple['floor'] + 0.35 * floor_stat,
+                0.0
+            )
+            ceiling = max(
+                0.35 * mc_simple['ceiling'] + 0.65 * ceil_stat,
+                0.0
+            )
             volatility = mc_simple.get('volatility_std', 0.0)
             mc_mean = mc_simple.get('mean', fpmin * base_min)
             mean_proj = capped_proj                 #added 12-16
@@ -862,8 +819,6 @@ class SimpleNBAProjection:
             p_8x = float(np.mean(sims >= salary * 0.008)) if sims.size else 0.0     #added 12-16
 
             leverage_score = (ceiling - mean_proj) / max(1.0, std)          #added 12-16
-
-
             results.append({
                 'Name': name,
                 'PlayerID': pid,
@@ -889,10 +844,178 @@ class SimpleNBAProjection:
             })
 
         out_df = pd.DataFrame(results).sort_values('Projection', ascending=False)
-        out_df = estimate_ownership(out_df) #added 12-16
-        #out_df = pd.DataFrame(results).sort_values('Projection', ascending=False)
+        out_df['BoomScore'] = out_df['BoomScore']
         out_df.fillna(0.0, inplace=True)
+        proj_mean = out_df['Projection'].mean()
+        salary_z = (out_df['Salary'] - out_df['Salary'].mean()) / out_df['Salary'].std()
+        min_z = (out_df['ProjMin'] - out_df['ProjMin'].mean()) / out_df['ProjMin'].std()
+        
+        shrink = (
+            0.78
+            + 0.06 * salary_z.clip(-1.5, 1.5)
+            + 0.04 * min_z.clip(-1.5, 1.5)
+        )
+        
+        shrink = shrink.clip(0.70, 0.90)
+        out_df['Projection'] = (
+        proj_mean + 0.88 * (out_df['Projection'] - proj_mean)
+        )
+        out_df['Projection_bc'] = out_df['Projection'] * BIAS_CORRECTION
 
+        # --- Volatility-tier specific z values ---
+        Z_BY_TIER = {
+            'LOW': 1.7,
+            'MED': 2.0,
+            'HIGH': 2.4
+        }
+        # Position ceiling adjustment
+        POS_Z_ADJ = {
+            'PG': 0.15,
+            'SG': 0.10,
+            'SF': 0.05,
+            'PF': -0.05,
+            'C': -0.15
+        }
+        out_df['z_base'] = out_df['VolatilityTier'].map(Z_BY_TIER).fillna(2.0)
+
+        out_df['z_pos'] = (
+            out_df['Position']
+            .str.split('/')
+            .str[0]
+            .map(POS_Z_ADJ)
+            .fillna(0.0)
+        )
+
+        out_df['z_vol'] = out_df['z_base'] + out_df['z_pos']
+        # Map z per player
+        out_df['z_vol'] = out_df['VolatilityTier'].map(Z_BY_TIER)
+
+        # Safety fallback (should never trigger, but protects pipeline)
+        out_df['z_vol'] = out_df['z_vol'].fillna(2.0)
+
+        # Minutes volatility dampener
+        out_df['MinFactor'] = np.clip(
+            36 / out_df['ProjMin'],
+            0.85,
+            1.25
+        )
+
+        out_df['Volatility_STD_adj'] = (
+            out_df['Volatility_STD'] * out_df['MinFactor']
+        )
+
+        # ------------------------
+        # FINAL FLOOR / CEILING (SINGLE SOURCE OF TRUTH)
+        # ------------------------
+
+        z = 2.1  # DFS realistic
+
+        vol = out_df['Volatility_STD'].clip(lower=1.0)
+
+        out_df['Ceiling_MC'] = (
+        out_df['Projection_bc'] + out_df['z_vol'] * out_df['Volatility_STD_adj']
+        )
+
+        out_df['Floor_MC'] = (
+        out_df['Projection_bc'] - out_df['z_vol'] * out_df['Volatility_STD_adj']
+        )
+
+        #------------------------
+        # salary dampener
+        #------------------------
+        salary_norm = out_df['Salary'] / out_df['Salary'].max()
+
+        out_df['BoomSalaryAdj'] = (
+            0.25 + 0.75 * (1 - salary_norm ** 0.85)
+        )
+        # ============================
+        # DFS-Adjusted BoomScore
+        # ============================
+
+        raw_boom = (
+            (out_df['Ceiling_MC'] - out_df['Projection_bc']) /
+            out_df['Projection_bc']
+        )
+
+        # Salary pressure penalty (key fix)
+        #salary_penalty = (out_df['Salary'] / 5000).clip(1.0, 3.0)
+        salary_penalty = (out_df['Salary'] / 7000).clip(0.85, 1.75)
+
+        out_df['BoomScore'] = (
+            raw_boom / salary_penalty
+        ).clip(0, 1.25)
+
+        # Volatility tier scaling (keep, but softer)
+        out_df['BoomScore'] *= out_df['VolatilityTier'].map({
+            'LOW': 0.75,
+            'MED': 1.0,
+            'HIGH': 1.15
+        }).fillna(1.0)
+
+        out_df['BoomScore'] = out_df['BoomScore'] ** 0.85       #added 12-23
+        
+        #applying dampener to boomscore
+        out_df['BoomScore'] = (
+            out_df['BoomScore'] *
+            out_df['BoomSalaryAdj']
+        )
+
+        # ------------------------
+        # NBA REALITY CAPS
+        # ------------------------
+
+        # No one exceeds ~95–105 in realistic NBA DFS
+        out_df['Ceiling_MC'] = np.minimum(
+            out_df['Ceiling_MC'],
+            out_df['Projection'] + 1.0 * out_df['ProjMin']
+        )
+
+        # Absolute sanity cap
+        out_df['Ceiling_MC'] = np.minimum(
+            out_df['Ceiling_MC'],
+            out_df['Projection'] * 1.9
+        )
+
+        # Floor protection
+        out_df['Floor_MC'] = np.maximum(
+            out_df['Floor_MC'],
+            out_df['Projection'] * 0.45
+        )
+
+        out_df['Floor_MC'] = out_df['Floor_MC'].clip(lower=0.0)
+        
+        #testing purpose only
+        #out_df[['Name','Salary','VolatilityTier','Projection','Ceiling_MC','BoomScore','GPP_Alpha']] \
+        #.sort_values('BoomScore', ascending=False).head(12)
+
+        # Clip ceilings/floors to reasonable range: max 2× volatility from projection
+        #out_df['Ceiling_MC'] = np.minimum(out_df['Ceiling_MC'], out_df['Projection'] + 3.2 * out_df['Volatility_STD'])
+        #out_df['Floor_MC']   = np.maximum(out_df['Floor_MC'], out_df['Projection'] - 2 * out_df['Volatility_STD'])
+
+        # Ensure floors are non-negative
+        out_df['Floor_MC'] = out_df['Floor_MC'].clip(lower=0.0)
+
+        #inject boomscore into ceiling
+        #out_df['Ceiling_MC'] = (
+        #out_df['Projection_bc'] +
+        #z * out_df['Volatility_STD_adj'] *
+        #(1 + 0.35 * out_df['BoomScore'])
+        #)
+    
+        minute_factor = np.clip(out_df['ProjMin'] / 30, 0.4, 1.1)           #added 12-22
+        out_df['Floor_MC'] *= minute_factor #added 12-22
+        out_df['Floor_MC'] = out_df['Floor_MC'].clip(lower=0)   #added 12-22
+        out_df['MinRisk'] = 1 / np.sqrt(out_df['ProjMin'].clip(lower=8))
+        out_df['MinRisk'] *= (1 - 0.4 * out_df['BoomScore'])        #added 12-23
+        out_df['MinRisk'] = out_df['MinRisk'].clip(0.05, 1.0)       #added 12-23
+        out_df = estimate_ownership(out_df) #added 12-16
+
+        #out_df['GPP_Alpha'] = (
+        #out_df['BoomScore'] *
+        #(1 - out_df['OwnershipProb'])
+        #)
+        #out_df.sort_values('GPP_Alpha', ascending=False)
+        #out_df['BoomScore'].describe()
         # ------------------------
         # Z-score helpers (FIRST)
         # ------------------------
@@ -910,17 +1033,8 @@ class SimpleNBAProjection:
         # ------------------------
         # Ownership estimation
         # ------------------------
-        #out_df = estimate_ownership(out_df)
 
         out_df['SalaryBias'] = out_df['Salary'].apply(salary_bias)
-
-        #out_df['OwnershipScore'] = (
-        #    0.35 * out_df['z_value'] +
-        #    0.25 * out_df['z_minutes'] +
-        #    0.20 * out_df['z_proj'] +
-        #    0.15 * out_df['z_ceil'] +
-        #    0.05 * out_df['SalaryBias']
-        #)
         out_df['OwnershipScore_Cash'] = (
             0.40 * out_df['z_value'] +
             0.30 * out_df['z_minutes'] +
@@ -936,16 +1050,6 @@ class SimpleNBAProjection:
             0.10 * out_df['z_minutes']
         )
 
-        #exp = np.exp(out_df['OwnershipScore'] - out_df['OwnershipScore'].max())
-        #out_df['Ownership'] = 100 * exp / exp.sum()
-        #out_df['OwnershipPct'] = 100 * exp / exp.sum()          #added 12-17
-        #out_df['OwnershipPct'] = 100 * out_df['OwnershipProb']
-        #out_df['OwnershipPct'] = np.clip(out_df['OwnershipPct'], 0.5, 40)
-        #out_df['OwnershipPct'] *= 100 / out_df['OwnershipPct'].sum()
-        #out_df['OwnershipProb'] = out_df['OwnershipPct'] / 100.0
-        # Step 1: raw OwnershipScore → probabilities
-        #exp = np.exp(out_df['OwnershipScore'] - out_df['OwnershipScore'].max())
-        #out_df['OwnershipProb'] = exp / exp.sum()  # fraction 0-1, sums to 1
         exp = np.exp(out_df['OwnershipScore_GPP'] - out_df['OwnershipScore_GPP'].max())
         out_df['OwnershipProb'] = exp / exp.sum()
         out_df['OwnershipPct'] = 100 * out_df['OwnershipProb']
@@ -980,6 +1084,29 @@ class SimpleNBAProjection:
         out_df['OwnershipPct'] *= (1 + 0.15 * out_df['CliffBoost'])
         out_df['OwnershipPct'] *= 100.0 / out_df['OwnershipPct'].sum()
         out_df['OwnershipProb'] = out_df['OwnershipPct'] / 100.0
+        
+        #tier_mult = {
+        #    "LOW": 0.85,
+        #    "MED": 1.00,
+        #    "HIGH": 1.20
+        #}
+#
+        #out_df['BoomScore'] = (
+        #    (out_df['Ceiling_MC'] - out_df['Projection']) /
+        #    out_df['Volatility_STD'].clip(lower=3.0)
+        #) * out_df['VolatilityTier'].map(tier_mult).fillna(1.0)
+
+        # ------------------------
+        # GPP ALPHA (Upside vs Ownership)
+        # ------------------------
+        out_df['GPP_Alpha'] = (
+            out_df['BoomScore'] *
+            (1 - out_df['OwnershipProb'])
+        )
+        out_df.sort_values('GPP_Alpha', ascending=False)
+        out_df['BoomScore'].describe()
+        #Ceiling_MC = out_df['Projection_bc'] + z * out_df['Volatility_STD']
+        #Floor_MC   = out_df['Projection_bc'] - z * out_df['Volatility_STD']
 
 
         def softmax_pct(s):
@@ -988,22 +1115,18 @@ class SimpleNBAProjection:
 
         out_df['CashOwnershipPct'] = softmax_pct(out_df['OwnershipScore_Cash'])
         out_df['GPPOwnershipPct']  = softmax_pct(out_df['OwnershipScore_GPP'])
+        
+        #out_df[['Name','Projection','Ceiling_MC','Volatility_STD','BoomScore']] \
+        #.sort_values('Ceiling_MC', ascending=False).head(10)
+
         # ------------------------
         # GPP / leverage metrics
         # ------------------------
-        #out_df['Leverage'] = (
-        #    #out_df['P_8x'] * 100 / np.clip(out_df['Ownership'], 1.0, None)
-        #    out_df['P_8x'] / np.clip(out_df['OwnershipProb'], 0.01, None) #added 12-17
-        #)
+        
         out_df['Leverage'] = (
             out_df['P_8x'] / np.clip(out_df['OwnershipProb'], 1e-4, None)
         )
 
-
-        #out_df['ChalkRisk'] = (
-        #    #out_df['Ownership'] * (1.0 - out_df['P_6x'])
-        #    out_df['OwnershipProb'] * (1.0 - out_df['P_6x'])    #added 12-17
-        #)
         out_df['ChalkRisk'] = out_df['OwnershipProb'] * (1.0 - out_df['P_6x'])
         if save_csv:
              out_df.to_csv(save_csv, index=False)
@@ -1057,8 +1180,8 @@ class SimpleNBAProjection:
         sims = np.array(sims)
 
         return {
-            'floor': float(np.percentile(sims, 20)),
-            'ceiling': float(np.percentile(sims, 90)),
+            'floor': float(np.percentile(sims, 18)),
+            'ceiling': float(np.percentile(sims, 88)),
             'volatility_std': float(np.std(sims, ddof=1)),
             'sims': sims     #added 12-16  
               }

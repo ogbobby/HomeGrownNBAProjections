@@ -1,20 +1,50 @@
 import pandas as pd
 from scipy.stats import spearmanr
 
-proj = pd.read_csv("projections12-17.csv")
-dk   = pd.read_csv("contest-standings-12-17.csv")
+# ----------------------------
+# Load data
+# ----------------------------
+proj = pd.read_csv("projections12-22.csv")
+dk   = pd.read_csv("contest-standings-12-22.csv")
 
+# ----------------------------
+# Normalize names FIRST
+# ----------------------------
 proj['Name'] = proj['Name'].str.lower().str.strip()
 dk['Player'] = dk['Player'].str.lower().str.strip()
 
-df = dk.merge(
-    proj,
-    left_on='Player',
-    right_on='Name',
-    how='left'
+# ----------------------------
+# Coverage check (correct)
+# ----------------------------
+common = set(dk['Player']) & set(proj['Name'])
+coverage = len(common) / dk['Player'].nunique()
+
+if coverage < 0.95:
+    raise ValueError(
+        f"Projection/contest mismatch: only {coverage:.1%} of players matched"
+    )
+
+# ----------------------------
+# STEP 2: Aggregate actual FPTS
+# ----------------------------
+actuals = (
+    dk.groupby('Player', as_index=False)['FPTS']
+      .mean()
 )
 
-df = df.dropna(subset=['Projection'])
+# ----------------------------
+# Merge projections with actuals
+# ----------------------------
+df = proj.merge(
+    actuals,
+    left_on='Name',
+    right_on='Player',
+    how='inner'
+)
+
+# ----------------------------
+# Projection accuracy metrics
+# ----------------------------
 df['Error'] = df['FPTS'] - df['Projection']
 
 metrics = {
@@ -26,26 +56,38 @@ metrics = {
 
 print(metrics)
 
+# ----------------------------
+# Ceiling calibration
+# ----------------------------
+#df['HitCeiling'] = df['FPTS'] >= (0.85 * df['Ceiling_MC'])
 df['HitCeiling'] = df['FPTS'] >= df['Ceiling_MC']
 
 ceiling_rate = (
-    df.groupby(pd.qcut(df['Ceiling_MC'], 5))
+    df.groupby(pd.qcut(df['Ceiling_MC'], 5, duplicates='drop'))
       ['HitCeiling']
       .mean()
 )
+df['CeilingResidual'] = df['ActualFPTS'] - df['Ceiling_MC']
+df.groupby('VolatilityTier')['CeilingResidual'].mean()
 
 print(ceiling_rate)
 
+# ----------------------------
+# Floor calibration
+# ----------------------------
 df['Busted'] = df['FPTS'] <= df['Floor_MC']
 
 bust_rate = (
-    df.groupby(pd.qcut(df['Floor_MC'], 5))
+    df.groupby(pd.qcut(df['Floor_MC'], 5, duplicates='drop'))
       ['Busted']
       .mean()
 )
 
 print(bust_rate)
 
+# ----------------------------
+# Value correlation
+# ----------------------------
 df['Value'] = df['FPTS'] / df['Salary']
 
 value_corr = spearmanr(
@@ -55,6 +97,9 @@ value_corr = spearmanr(
 
 print("Value Spearman:", value_corr)
 
+# ----------------------------
+# Lineup finish analysis
+# ----------------------------
 lineups = (
     dk.groupby('EntryId')
       .agg(
@@ -66,8 +111,12 @@ lineups = (
 lineups['FinishPct'] = 1 - lineups['Rank'] / lineups['Rank'].max()
 print(lineups['FinishPct'].describe())
 
+# ----------------------------
+# Exposure analysis
+# ----------------------------
 exposure = (
-    df.groupby('Name')
+    dk.merge(proj, left_on='Player', right_on='Name')
+      .groupby('Name')
       .agg(
           MeanFPTS=('FPTS', 'mean'),
           Projection=('Projection', 'mean'),
@@ -76,5 +125,4 @@ exposure = (
 )
 
 exposure['Error'] = exposure['MeanFPTS'] - exposure['Projection']
-
 print(exposure.sort_values('Exposure', ascending=False).head(20))
