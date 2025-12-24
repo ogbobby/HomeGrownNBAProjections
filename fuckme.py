@@ -983,24 +983,9 @@ class SimpleNBAProjection:
         )
 
         out_df['Floor_MC'] = out_df['Floor_MC'].clip(lower=0.0)
-        
-        #testing purpose only
-        #out_df[['Name','Salary','VolatilityTier','Projection','Ceiling_MC','BoomScore','GPP_Alpha']] \
-        #.sort_values('BoomScore', ascending=False).head(12)
-
-        # Clip ceilings/floors to reasonable range: max 2× volatility from projection
-        #out_df['Ceiling_MC'] = np.minimum(out_df['Ceiling_MC'], out_df['Projection'] + 3.2 * out_df['Volatility_STD'])
-        #out_df['Floor_MC']   = np.maximum(out_df['Floor_MC'], out_df['Projection'] - 2 * out_df['Volatility_STD'])
 
         # Ensure floors are non-negative
         out_df['Floor_MC'] = out_df['Floor_MC'].clip(lower=0.0)
-
-        #inject boomscore into ceiling
-        #out_df['Ceiling_MC'] = (
-        #out_df['Projection_bc'] +
-        #z * out_df['Volatility_STD_adj'] *
-        #(1 + 0.35 * out_df['BoomScore'])
-        #)
     
         minute_factor = np.clip(out_df['ProjMin'] / 30, 0.4, 1.1)           #added 12-22
         out_df['Floor_MC'] *= minute_factor #added 12-22
@@ -1010,12 +995,6 @@ class SimpleNBAProjection:
         out_df['MinRisk'] = out_df['MinRisk'].clip(0.05, 1.0)       #added 12-23
         out_df = estimate_ownership(out_df) #added 12-16
 
-        #out_df['GPP_Alpha'] = (
-        #out_df['BoomScore'] *
-        #(1 - out_df['OwnershipProb'])
-        #)
-        #out_df.sort_values('GPP_Alpha', ascending=False)
-        #out_df['BoomScore'].describe()
         # ------------------------
         # Z-score helpers (FIRST)
         # ------------------------
@@ -1084,17 +1063,6 @@ class SimpleNBAProjection:
         out_df['OwnershipPct'] *= (1 + 0.15 * out_df['CliffBoost'])
         out_df['OwnershipPct'] *= 100.0 / out_df['OwnershipPct'].sum()
         out_df['OwnershipProb'] = out_df['OwnershipPct'] / 100.0
-        
-        #tier_mult = {
-        #    "LOW": 0.85,
-        #    "MED": 1.00,
-        #    "HIGH": 1.20
-        #}
-#
-        #out_df['BoomScore'] = (
-        #    (out_df['Ceiling_MC'] - out_df['Projection']) /
-        #    out_df['Volatility_STD'].clip(lower=3.0)
-        #) * out_df['VolatilityTier'].map(tier_mult).fillna(1.0)
 
         # ------------------------
         # GPP ALPHA (Upside vs Ownership)
@@ -1105,9 +1073,6 @@ class SimpleNBAProjection:
         )
         out_df.sort_values('GPP_Alpha', ascending=False)
         out_df['BoomScore'].describe()
-        #Ceiling_MC = out_df['Projection_bc'] + z * out_df['Volatility_STD']
-        #Floor_MC   = out_df['Projection_bc'] - z * out_df['Volatility_STD']
-
 
         def softmax_pct(s):
             exp = np.exp(s - s.max())
@@ -1116,9 +1081,6 @@ class SimpleNBAProjection:
         out_df['CashOwnershipPct'] = softmax_pct(out_df['OwnershipScore_Cash'])
         out_df['GPPOwnershipPct']  = softmax_pct(out_df['OwnershipScore_GPP'])
         
-        #out_df[['Name','Projection','Ceiling_MC','Volatility_STD','BoomScore']] \
-        #.sort_values('Ceiling_MC', ascending=False).head(10)
-
         # ------------------------
         # GPP / leverage metrics
         # ------------------------
@@ -1128,6 +1090,68 @@ class SimpleNBAProjection:
         )
 
         out_df['ChalkRisk'] = out_df['OwnershipProb'] * (1.0 - out_df['P_6x'])
+        
+        # ========================================
+        # GPP Tier Assignment (drop code here)
+        # ========================================
+        out_df['BoomPct'] = out_df['BoomScore'].rank(pct=True)
+        # Assign tier
+        def assign_gpp_tier(pct):
+            if pct >= 0.9:
+                return 'Core'
+            elif pct >= 0.6:
+                return 'Secondary'
+            else:
+                return 'Sprinkle'
+        
+        out_df['GPP_Tier'] = out_df['BoomPct'].apply(assign_gpp_tier).astype(str)
+        
+        # Optional Mini-Sprinkle for cheap players (<$8500)
+        out_df.loc[out_df['Salary'] < 8500, 'GPP_Tier'] = out_df.loc[out_df['Salary'] < 8500, 'GPP_Tier'].apply(
+            lambda x: 'Mini-Sprinkle' if x != 'Core' else x
+        )
+
+        # out_df['GPP_Tier'] = pd.qcut(
+        #     out_df['BoomScore'], 
+        #     q=[0, 0.6, 0.9, 1.0],
+        #     labels=['Sprinkle', 'Secondary', 'Core'],
+        #     duplicates='drop'
+        # ).astype(str)  # convert to string to allow new category
+
+        # # Then apply Mini-Sprinkle logic safely
+        # out_df.loc[out_df['Salary'] < 8500, 'GPP_Tier'] = out_df.loc[out_df['Salary'] < 8500, 'GPP_Tier'].apply(
+        #     lambda x: 'Mini-Sprinkle' if x != 'Core' else x
+        # )
+
+        # # Optional ownership cap for Core
+        # out_df.loc[(out_df['GPP_Tier'] == 'Core') & (out_df['Ownership'] > 0.25), 'GPP_Tier'] = 'Secondary'
+
+        # Drop temp column if you want
+        out_df.drop(columns=['BoomPct'], inplace=True)
+        #df = out_df.copy()  # or just use out_df if you prefer
+        #df['BoomPct'] = df['BoomScore'].rank(pct=True)
+#
+        #def assign_gpp_tier(pct):
+        #    if pct >= 0.75:
+        #        return 'Core'
+        #    elif pct >= 0.40:
+        #        return 'Secondary'
+        #    else:
+        #        return 'Sprinkle'
+#
+        #df['GPP_Tier'] = df['BoomPct'].apply(assign_gpp_tier)
+#
+        ## Optional Mini-Sprinkle for cheap players (<$8500)
+        #df.loc[df['Salary'] < 8500, 'GPP_Tier'] = df.loc[df['Salary'] < 8500, 'GPP_Tier'].apply(
+        #    lambda x: 'Mini-Sprinkle' if x != 'Core' else x
+        #)
+#
+        ## Optional ownership cap for Core
+        #df.loc[(df['GPP_Tier'] == 'Core') & (df['Ownership'] > 0.25), 'GPP_Tier'] = 'Secondary'
+#
+        ## Drop temp column if you want
+        #df.drop(columns=['BoomPct'], inplace=True)
+
         if save_csv:
              out_df.to_csv(save_csv, index=False)
              print(f"✅ Saved projections to {save_csv}")
