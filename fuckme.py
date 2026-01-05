@@ -10,7 +10,7 @@ Single-file NBA DFS projection system:
 - Vegas odds integration (Rotowire scraper)
 - CLI runner
 """
-
+import pulp
 import argparse
 import math
 import time
@@ -23,6 +23,9 @@ import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # nba_api imports (user must have nba_api installed)
 from nba_api.stats.endpoints import playergamelogs, leaguedashteamstats, scoreboardv2
@@ -81,6 +84,16 @@ VOLATILITY_MULTIPLIER = {
     "LOW": 0.85
 }
 BIAS_CORRECTION = 1.045
+DK_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
+
+def eligible(player_pos, slot):
+    if slot == "UTIL":
+        return True
+    if slot == "G":
+        return player_pos in ("PG", "SG")
+    if slot == "F":
+        return player_pos in ("SF", "PF")
+    return player_pos == slot
 # -------------------------
 # Utility: CSV header mapping
 # -------------------------
@@ -453,22 +466,40 @@ def monte_carlo_per_stat(
     player_logs: pd.DataFrame,
     n_sims: int = 2000,
     seed: int = 42
-) -> Dict[str, Dict[str, float]]:
+) -> Dict[str, float]:
 
     if player_logs is None or player_logs.empty:
-        return {}
+        return {
+            'mean': 0.0,
+            'floor': 0.0,
+            'ceiling': 0.0,
+            'std': 0.0,
+            'sims': np.array([])
+        }
 
     rng = np.random.default_rng(seed)
+
     stat_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FG3M', 'TOV']
 
-    # Collect sims per stat
-    sims = {s: [] for s in stat_cols}
+    # DraftKings weights
+    DK_WEIGHTS = {
+        'PTS': 1.0,
+        'REB': 1.25,
+        'AST': 1.5,
+        'STL': 2.0,
+        'BLK': 2.0,
+        'FG3M': 0.5,
+        'TOV': -0.5
+    }
+
+    sims = []
 
     for _ in range(n_sims):
-        # 1️⃣ Sample a real game
+
+        # 1️⃣ Sample a real game (preserves correlations)
         row = player_logs.sample(1).iloc[0]
 
-        # 2️⃣ Correlated draw
+        # 2️⃣ Correlated volatility draw (KEEPING YOUR LOGIC)
         base = rng.normal(1.0, 0.12)
 
         draw = {
@@ -481,26 +512,99 @@ def monte_carlo_per_stat(
             'TOV':  row.get('TOV', 0)  * rng.normal(1.0, 0.20),
         }
 
-        # 3️⃣ Store results
-        for stat in stat_cols:
-            sims[stat].append(max(0.0, float(draw.get(stat, 0.0))))
+        # Clamp negatives
+        for k in draw:
+            draw[k] = max(0.0, float(draw[k]))
 
-    # 4️⃣ Aggregate
-    mc = {}
-    for stat in stat_cols:
-        arr = np.array(sims[stat])
-        if len(arr) == 0:
-            mc[stat] = {'floor': 0.0, 'ceiling': 0.0, 'std': 0.0}
-            continue
+        # 3️⃣ Base DK fantasy points
+        dk_points = sum(
+            draw[s] * DK_WEIGHTS[s]
+            for s in DK_WEIGHTS
+        )
 
-        mc[stat] = {
-            'floor': float(np.percentile(arr, 20)),
-            'ceiling': float(np.percentile(arr, 90)),
-            'std': float(np.std(arr, ddof=1))
-        }
+        # 4️⃣ Double / Triple Double bonuses
+        categories = [
+            draw['PTS'] >= 10,
+            draw['REB'] >= 10,
+            draw['AST'] >= 10,
+            draw['STL'] >= 10,
+            draw['BLK'] >= 10
+        ]
 
-    return mc
+        count = sum(categories)
 
+        if count >= 3:
+            dk_points += 3.0
+        elif count >= 2:
+            dk_points += 1.5
+
+        sims.append(dk_points)
+
+    sims = np.array(sims)
+
+    return {
+        'mean': float(np.mean(sims)),
+        'floor': float(np.percentile(sims, 20)),
+        'ceiling': float(np.percentile(sims, 90)),
+        'std': float(np.std(sims, ddof=1)),
+        'sims': sims
+    }
+
+def evaluate_lineup_mc(
+    lineup: pd.DataFrame,
+    n_sims: int = 5000,
+    cash_line: float = 270.0,     # adjust per slate
+    rng: np.random.Generator | None = None
+) -> dict:
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Pull per-player distribution params
+    means = lineup["MC_Mean"].values
+    stds  = lineup["Volatility_STD"].values
+
+    sims = []
+
+    for _ in range(n_sims):
+        draw = rng.normal(means, stds)
+        sims.append(draw.sum())
+
+    sims = np.array(sims)
+
+    return {
+        "Lineup_Mean": float(np.mean(sims)),
+        "Lineup_P90": float(np.percentile(sims, 90)),
+        "Lineup_P95": float(np.percentile(sims, 95)),
+        "Lineup_P99": float(np.percentile(sims, 99)),
+        "P_Cash": float(np.mean(sims >= cash_line)),
+        "P_Top1": float(np.mean(sims >= np.percentile(sims, 99)))
+    }
+
+def score_lineup(lineup: pd.DataFrame) -> dict:
+    return {
+        "LineupProj": lineup["Projection"].sum(),
+        "LineupCeiling": lineup["Ceiling_MC"].sum(),
+        "LineupFloor": lineup["Floor_MC"].sum(),
+        "LineupSalary": lineup["Salary"].sum()
+    }
+
+def evaluate_lineups_mc(lineups: list[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Evaluate multiple lineups using Monte Carlo.
+    Wrapper around evaluate_lineup_mc().
+    """
+
+    rows = []
+
+    for i, lineup in enumerate(lineups, start=1):
+        stats = evaluate_lineup_mc(lineup)
+
+        stats["Lineup"] = float(i)
+        rows.append(stats)
+
+    df = pd.DataFrame(rows).set_index("Lineup")
+    return df
 # -------------------------
 # Core projection class
 # -------------------------
@@ -615,10 +719,8 @@ class SimpleNBAProjection:
                 df[c] = 0
         # Lowercase player name for matching
         df['PLAYER_NAME_L'] = df['PLAYER_NAME'].apply(normalize_name)
-        #df['PLAYER_NAME_L'] = df['PLAYER_NAME'].astype(str).str.lower().str.strip()
         # Filter to DK slate players
         dk_names = set(self.dk_df['Name'].apply(normalize_name))
-        #dk_names = set(self.dk_df['Name'].str.lower())
         df = df[df['PLAYER_NAME_L'].isin(dk_names)].copy()
         return df
 
@@ -686,10 +788,7 @@ class SimpleNBAProjection:
         Adjust multiplier based on opponent's defense and pace.
         More extreme values produce noticeable changes in projections.
         """
-        #print(f"[DEBUG] matchup_multiplier called for {team_abbr}")
-        #print(f"[DEBUG] todays_matchups keys: {list(self.todays_matchups.keys())}")
         opp = self.todays_matchups.get(team_abbr, {}).get('opponent')
-        #print(f"[DEBUG] No matchup found for {team_abbr}, returning 1.0")
         if not opp:
             return 1.0
 
@@ -793,12 +892,16 @@ class SimpleNBAProjection:
             mc_simple = self.monte_carlo(fp_min_list=stats.get('fp_min_list', []),
                                          min_list=stats.get('min_list', []),
                                          matchup_mult=matchup_mult, projected_minutes=base_min, vegas_mult=vegas_mult, n_sims=n_sims)
-            # Monte Carlo per-stat for floor/ceiling derivation (optional, expensive)
-            per_stat_mc = monte_carlo_per_stat(stats.get('logs_df', pd.DataFrame()), n_sims=n_sims)
-            # Convert per-stat floors/ceilings to DK FP floor/ceiling with scoring weights
-            stat_weights = {'PTS': 1.0, 'REB': 1.2, 'AST': 1.5, 'STL': 3.0, 'BLK': 3.0, 'FG3M': 0.5, 'TOV': -1.0}
-            floor_stat = sum(per_stat_mc[s]['floor'] * stat_weights.get(s, 0.0) for s in per_stat_mc)
-            ceil_stat = sum(per_stat_mc[s]['ceiling'] * stat_weights.get(s, 0.0) for s in per_stat_mc)
+            per_stat_mc = monte_carlo_per_stat(
+                stats.get('logs_df', pd.DataFrame()),
+                n_sims=n_sims
+            )
+
+            floor_stat = per_stat_mc['floor']
+            ceil_stat  = per_stat_mc['ceiling']
+            mc_mean    = per_stat_mc['mean']
+            sims       = per_stat_mc['sims']
+
             floor = max(
                 0.65 * mc_simple['floor'] + 0.35 * floor_stat,
                 0.0
@@ -1111,46 +1214,8 @@ class SimpleNBAProjection:
             lambda x: 'Mini-Sprinkle' if x != 'Core' else x
         )
 
-        # out_df['GPP_Tier'] = pd.qcut(
-        #     out_df['BoomScore'], 
-        #     q=[0, 0.6, 0.9, 1.0],
-        #     labels=['Sprinkle', 'Secondary', 'Core'],
-        #     duplicates='drop'
-        # ).astype(str)  # convert to string to allow new category
-
-        # # Then apply Mini-Sprinkle logic safely
-        # out_df.loc[out_df['Salary'] < 8500, 'GPP_Tier'] = out_df.loc[out_df['Salary'] < 8500, 'GPP_Tier'].apply(
-        #     lambda x: 'Mini-Sprinkle' if x != 'Core' else x
-        # )
-
-        # # Optional ownership cap for Core
-        # out_df.loc[(out_df['GPP_Tier'] == 'Core') & (out_df['Ownership'] > 0.25), 'GPP_Tier'] = 'Secondary'
-
-        # Drop temp column if you want
+        # Drop temp column 
         out_df.drop(columns=['BoomPct'], inplace=True)
-        #df = out_df.copy()  # or just use out_df if you prefer
-        #df['BoomPct'] = df['BoomScore'].rank(pct=True)
-#
-        #def assign_gpp_tier(pct):
-        #    if pct >= 0.75:
-        #        return 'Core'
-        #    elif pct >= 0.40:
-        #        return 'Secondary'
-        #    else:
-        #        return 'Sprinkle'
-#
-        #df['GPP_Tier'] = df['BoomPct'].apply(assign_gpp_tier)
-#
-        ## Optional Mini-Sprinkle for cheap players (<$8500)
-        #df.loc[df['Salary'] < 8500, 'GPP_Tier'] = df.loc[df['Salary'] < 8500, 'GPP_Tier'].apply(
-        #    lambda x: 'Mini-Sprinkle' if x != 'Core' else x
-        #)
-#
-        ## Optional ownership cap for Core
-        #df.loc[(df['GPP_Tier'] == 'Core') & (df['Ownership'] > 0.25), 'GPP_Tier'] = 'Secondary'
-#
-        ## Drop temp column if you want
-        #df.drop(columns=['BoomPct'], inplace=True)
 
         if save_csv:
              out_df.to_csv(save_csv, index=False)
@@ -1209,7 +1274,434 @@ class SimpleNBAProjection:
             'volatility_std': float(np.std(sims, ddof=1)),
             'sims': sims     #added 12-16  
               }
+def optimize_dk_lineup(
+    df: pd.DataFrame,
+    salary_cap: int = 50000,
+    prev_lineups: list[list] = None,
+    max_overlap: int = 2,
+    seed: int = 42
+) -> pd.DataFrame:
+    """
+    Single lineup optimizer using linear programming (pulp)
+    df: DataFrame with columns ['PlayerID', 'Position', 'Salary', 'OBJ']
+    prev_lineups: list of previous lineups (each a list of PlayerIDs) for max_overlap constraints
+    """
 
+    rng = np.random.default_rng(seed)
+    df = df.copy()
+    playerid_to_index = dict(zip(df['PlayerID'], df.index))
+    n_players = len(df)
+
+    # Decision variables
+    x = pulp.LpVariable.dicts("player", df.index, 0, 1, cat="Binary")
+
+    prob = pulp.LpProblem("DK_Lineup", pulp.LpMaximize)
+
+    # Objective: maximize OBJ
+    prob += pulp.lpSum(df.loc[i, "OBJ"] * x[i] for i in df.index)
+
+    # Salary cap
+    prob += pulp.lpSum(df.loc[i, "Salary"] * x[i] for i in df.index) <= salary_cap
+
+    # Exactly 8 players
+    prob += pulp.lpSum(x[i] for i in df.index) == 8
+
+    # Positional constraints: DK roster
+    positions = {
+        "PG": 1, "SG": 1, "SF": 1, "PF": 1, "C": 1,
+    }
+    # Allow flex for PG/SG/SF/PF (last 3 spots)
+    flex_positions = ["PG", "SG", "SF", "PF"]
+
+    # Force at least 1 per core position, allow flex separately
+    for pos, count in positions.items():
+        prob += pulp.lpSum(x[i] for i in df.index if df.loc[i, "Position"] == pos) >= count
+
+    # Max overlap with previous lineups
+    if prev_lineups:
+        for prev in prev_lineups:
+            prev_ids = set(prev["PlayerID"])
+            prob += pulp.lpSum(
+                x[i] for i in df.index if df.loc[i, "PlayerID"] in prev_ids
+            ) <= max_overlap
+            # Only keep PlayerIDs that exist in current df
+            #valid_players = [pid for pid in lineup_players if pid in playerid_to_index]
+            #if valid_players:
+            #    prob += pulp.lpSum(x[playerid_to_index[pid]] for pid in valid_players) <= max_overlap
+
+    # Solve
+    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+    # Collect selected players
+    selected = [i for i in df.index if x[i].value() > 0.5]
+    if not selected:
+        return pd.DataFrame()  # failed to generate lineup
+
+    return df.loc[selected].copy()
+
+def generate_gpp_lineups(
+    df: pd.DataFrame,
+    n_lineups: int = 50,
+    max_exposure: float = 0.4,
+    salary_cap: int = 50000,
+    seed: int = 42
+) -> list[pd.DataFrame]:
+    """
+    Generate multiple GPP lineups with exposure constraints.
+    df: DataFrame with ['PlayerID', 'Position', 'Salary', 'Projection', 'Ceiling_MC', 'GPP_Alpha']
+    """
+    rng = np.random.default_rng(seed)
+    lineups = []
+    exposure = defaultdict(int)
+    prev_lineups = []
+
+    max_appearances = int(n_lineups * max_exposure)
+
+    for i in range(n_lineups):
+        df_iter = df.copy()
+
+        # -------------------------
+        # Add noise for GPP variability
+        # -------------------------
+        for pid, count in exposure.items():
+            if count >= max_appearances:
+                df_iter = df_iter[df_iter["PlayerID"] != pid]
+
+        # Safety check
+        if len(df_iter) < 20:
+            continue
+        df_iter["OBJ"] = (
+            0.50 * df_iter["Projection"] +
+            0.35 * df_iter["Ceiling_MC"] +
+            0.15 * df_iter["GPP_Alpha"]
+        ) #* df_iter["Noise"]
+        df_iter["OBJ"] *= rng.uniform(0.80, 1.25, size=len(df_iter))
+
+        # -------------------------
+        # Limit exposure based on previous lineups
+        # -------------------------
+        for idx in df_iter.index:
+            pid = df_iter.loc[idx, "PlayerID"]
+            if exposure[pid] >= max_appearances:
+                df_iter.loc[idx, "OBJ"] *= 0.01  # effectively fades
+
+        # Generate lineup
+        lineup = optimize_dk_lineup(
+            df=df_iter,
+            #mode="gpp",
+            #salary_cap=salary_cap,
+            prev_lineups=lineups,
+            max_overlap=5,
+            #seed=int(rng.integers(1_000_000))
+        )
+        # -------------------------
+        # Score lineup
+        # -------------------------
+        scores = score_lineup(lineup)
+
+        for k, v in scores.items():
+            lineup[k] = v
+
+        lineup["LineupID"] = i + 1
+        lineups.append(lineup)
+
+        if lineup.empty:
+            continue
+
+        # Update exposure
+        for pid in lineup['PlayerID']:
+            exposure[pid] += 1
+
+        prev_lineups.append(list(lineup['PlayerID']))
+        mc = evaluate_lineup_mc(
+            lineup,
+            n_sims=3000,
+            cash_line=270,   # tune per slate size
+            rng=rng
+        )
+
+        lineup = lineup.assign(
+            Lineup=i + 1,
+            Lineup_Mean=mc["Lineup_Mean"],
+            Lineup_P90=mc["Lineup_P90"],
+            Lineup_P95=mc["Lineup_P95"],
+            Lineup_P99=mc["Lineup_P99"],
+            P_Cash=mc["P_Cash"],
+            P_Top1=mc["P_Top1"]
+        )
+
+        lineups.append(lineup)
+
+        #lineup = lineup.assign(Lineup=i + 1)
+        #lineups.append(lineup)
+
+    # Final sanity checks
+    all_players = pd.concat(lineups)
+    
+    summary = (
+    pd.concat(lineups)
+      .groupby("LineupID")
+      .first()[["LineupProj", "LineupCeiling", "LineupSalary"]]
+      .sort_values("LineupProj", ascending=False)
+    )
+
+    print("\n📊 Lineup Summary (Top 10)")
+    print(summary.head(10))
+    print("\n🧪 Sanity check: exposure across lineups")
+    print(all_players.groupby("PlayerID")["Lineup"].count())
+    print("\n🧪 Lineup size stats:")
+    print(all_players.groupby("Lineup")["PlayerID"].count())
+
+    return lineups
+
+def generate_gpp_lineups_recycling(
+    df: pd.DataFrame,
+    n_lineups: int = 50,
+    salary_cap: int = 50000,
+    cash_threshold: float = 0.55,
+    max_iters: int = 6,
+    seed: int = 42
+):
+    rng = np.random.default_rng(seed)
+
+    kept_lineups = []
+    exposure = defaultdict(int)
+
+    iter_num = 0
+
+    while len(kept_lineups) < n_lineups and iter_num < max_iters:
+        iter_num += 1
+        print(f"\n🔁 Recycling iteration {iter_num}")
+
+        needed = n_lineups - len(kept_lineups)
+        batch_lineups = []
+
+        for i in range(needed):
+            df_iter = df.copy()
+
+            # -------------------------
+            # Exposure-based penalties
+            # -------------------------
+            noise = []
+            for pid in df_iter["PlayerID"]:
+                exp_rate = exposure[pid] / max(1, len(kept_lineups))
+                if exp_rate >= 0.35:
+                    noise.append(0.70)
+                else:
+                    noise.append(rng.uniform(0.85, 1.15))
+
+            df_iter["OBJ"] = (
+                0.55 * df_iter["Projection"] +
+                0.35 * df_iter["Ceiling_MC"] +
+                0.10 * df_iter["GPP_Alpha"]
+            ) * noise
+
+            lineup = optimize_dk_lineup(
+                df=df_iter,
+                salary_cap=salary_cap
+            )
+
+            if lineup.empty:
+                continue
+
+            batch_lineups.append(lineup)
+
+        if not batch_lineups:
+            break
+
+        # -------------------------
+        # Score batch via MC
+        # -------------------------
+        scored = evaluate_lineups_mc(batch_lineups)
+
+        # -------------------------
+        # Keep strong lineups
+        # -------------------------
+        survivors = scored[scored["P_Cash"] >= cash_threshold]
+
+        print(f"✅ Kept {len(survivors)} / {len(scored)}")
+
+        for lid in survivors.index:
+            lineup = batch_lineups[int(lid) - 1]
+
+            kept_lineups.append(
+                lineup.assign(Lineup=len(kept_lineups) + 1)
+            )
+
+            for pid in lineup["PlayerID"]:
+                exposure[pid] += 1
+
+        # Stop early if we're full
+        if len(kept_lineups) >= n_lineups:
+            break
+
+    print(f"\n🏁 Final lineup count: {len(kept_lineups)}")
+
+    return kept_lineups
+
+def lineup_sanity_checks(lineups: list[pd.DataFrame]):
+    """
+    Perform sanity checks and plots for multi-lineup sets.
+
+    Args:
+        lineups: list of DataFrames representing lineups
+    """
+    if not lineups:
+        print("No lineups to check.")
+        return
+
+    # -------------------------
+    # Combine all lineups
+    # -------------------------
+    all_lineups = pd.concat(lineups, ignore_index=True)
+    
+    # -------------------------
+    # Exposure counts
+    # -------------------------
+    exposure = all_lineups.groupby("Name").size().reset_index(name="Lineup")
+    print("\n🧪 Sanity check: exposure across lineups")
+    print(exposure.sort_values("Lineup", ascending=False).head(15))
+
+    # -------------------------
+    # Lineup size stats
+    # -------------------------
+    print("\n🧪 Lineup size stats:")
+    lineup_sizes = all_lineups.groupby("Lineup").size()
+    print(lineup_sizes.describe())
+    
+    # -------------------------
+    # Floor/Ceiling vs Exposure plot
+    # -------------------------
+    avg_stats = all_lineups.groupby("Name")[["Floor_MC", "Ceiling_MC"]].mean().reset_index()
+    df_plot = exposure.merge(avg_stats, on="Name")
+    df_plot = df_plot.sort_values(by="Lineup", ascending=False)
+
+    plt.figure(figsize=(14,6))
+    sns.scatterplot(data=df_plot, x="Lineup", y="Floor_MC", color="skyblue", s=100, label="Floor")
+    sns.scatterplot(data=df_plot, x="Lineup", y="Ceiling_MC", color="orange", s=100, label="Ceiling")
+    plt.title("Player Exposure vs. Floor and Ceiling")
+    plt.xlabel("Exposure (# of lineups)")
+    plt.ylabel("Points")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.show()
+
+    # -------------------------
+    # Optional: Exposure vs Projection
+    # -------------------------
+    if "Projection" in all_lineups.columns:
+        avg_stats = all_lineups.groupby("Name")[["Projection"]].mean().reset_index()
+        df_plot2 = exposure.merge(avg_stats, on="Name")
+        df_plot2 = df_plot2.sort_values("Lineup", ascending=False)
+
+        plt.figure(figsize=(14,6))
+        sns.scatterplot(data=df_plot2, x="Lineup", y="Projection", size="Lineup",
+                        hue="Projection", palette="viridis", legend="brief", sizes=(50,300))
+        plt.title("Player Exposure vs Projection")
+        plt.xlabel("Exposure (# of lineups)")
+        plt.ylabel("Projected Points")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.show()
+    lineup_sanity_checks(lineups)
+
+# ============================
+# LINEUP-LEVEL MONTE CARLO
+# ============================
+
+def score_lineup_mc(
+    lineup: pd.DataFrame,
+    n_sims: int = 3000,
+    seed: int = 42
+) -> dict:
+    rng = np.random.default_rng(seed)
+
+    means = lineup["Projection"].values
+    stds  = lineup["Volatility_STD"].values
+
+    sims = rng.normal(
+        loc=means,
+        scale=stds,
+        size=(n_sims, len(lineup))
+    ).sum(axis=1)
+
+    return {
+        "LineupMean": sims.mean(),
+        "LineupFloor": np.percentile(sims, 20),
+        "LineupCeiling": np.percentile(sims, 90),
+        "LineupStd": sims.std(),
+        "CashProb": (sims >= np.percentile(sims, 50)).mean(),
+        "Top1Pct": (sims >= np.percentile(sims, 99)).mean()
+    }
+
+
+def plot_player_exposure(lineups: list[pd.DataFrame], top_n: int = 25):
+    """
+    Bar chart of player exposure across generated lineups
+    """
+    all_players = pd.concat(lineups)
+
+    exposure = (
+        all_players.groupby("Name")
+        .size()
+        .sort_values(ascending=False)
+        .head(top_n)
+    )
+
+    plt.figure(figsize=(10, 6))
+    exposure.sort_values().plot(kind="barh")
+    plt.title("Top Player Exposure Across Lineups")
+    plt.xlabel("Lineups Used")
+    plt.ylabel("Player")
+
+    plt.tight_layout()
+    plt.savefig("player_exposure.png", dpi=300)
+    print("📊 Saved: player_exposure.png")
+
+    try:
+        plt.show()
+    except:
+        pass
+
+def plot_salary_distribution(lineups: list[pd.DataFrame]):
+    totals = [lu["Salary"].sum() for lu in lineups]
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(totals, bins=10)
+    plt.title("Salary Distribution Across Lineups")
+    plt.xlabel("Total Salary")
+    plt.ylabel("Count")
+
+    plt.tight_layout()
+    plt.savefig("salary_distribution.png", dpi=300)
+    print("📊 Saved: salary_distribution.png")
+
+    try:
+        plt.show()
+    except:
+        pass
+
+def plot_ceiling_vs_projection(df: pd.DataFrame):
+    plt.figure(figsize=(7, 6))
+    plt.scatter(df["Projection"], df["Ceiling_MC"], alpha=0.5)
+
+    plt.plot(
+        [df["Projection"].min(), df["Projection"].max()],
+        [df["Projection"].min(), df["Projection"].max()],
+        linestyle="--"
+    )
+
+    plt.xlabel("Projection")
+    plt.ylabel("Ceiling")
+    plt.title("Projection vs Ceiling")
+
+    plt.tight_layout()
+    plt.savefig("ceiling_vs_projection.png", dpi=300)
+    print("📊 Saved: ceiling_vs_projection.png")
+
+    try:
+        plt.show()
+    except:
+        pass
 # -------------------------
 # Top-level helper for CLI
 # -------------------------
@@ -1224,19 +1716,44 @@ def apply_injury_minutes_adjustment(base_minutes: float, injury_status: str) -> 
 # CLI entrypoint
 # -------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Simple NBA DFS projections with injuries & Monte Carlo")
-    parser.add_argument('--salaries', required=True, help='DraftKings salaries CSV (your header supported)')
-    parser.add_argument('--out', default='projections.csv', help='Optional output CSV path')
-    parser.add_argument('--days', type=int, default=30, help='Days of history for logs (default 30)')
-    parser.add_argument('--n_sims', type=int, default=1500, help='Monte Carlo simulations per player (default 1500)')
-    parser.add_argument('--no-inj', dest='use_injuries', action='store_false', help='Disable scraping ESPN injuries')
+    parser = argparse.ArgumentParser(
+        description="Simple NBA DFS projections with injuries & Monte Carlo"
+    )
+    parser.add_argument('--salaries', required=True,
+                        help='DraftKings salaries CSV (your header supported)')
+    parser.add_argument('--out', default='projections.csv',
+                        help='Optional output CSV path')
+    parser.add_argument('--days', type=int, default=30,
+                        help='Days of history for logs (default 30)')
+    parser.add_argument('--n_sims', type=int, default=1500,
+                        help='Monte Carlo simulations per player (default 1500)')
+    parser.add_argument('--no-inj', dest='use_injuries',
+                        action='store_false',
+                        help='Disable scraping ESPN injuries')
+
+    parser.add_argument(
+        '--optimize',
+        choices=['cash', 'gpp', 'gpp-multi'],
+        help='Run DraftKings lineup optimizer (cash or gpp)'
+    )
+
+    parser.add_argument(
+        '--lineup-out',
+        default='lineup.csv',
+        help='Output CSV for optimized lineup'
+    )
+
     args = parser.parse_args()
 
-    model = SimpleNBAProjection(dk_salaries_path=args.salaries, days_of_history=args.days)
+    model = SimpleNBAProjection(
+        dk_salaries_path=args.salaries,
+        days_of_history=args.days
+    )
+
     if not model.load_dk_salaries():
         print("❌ Failed to load DraftKings CSV — aborting")
         return
-
+    
     injuries = {}
     if args.use_injuries:
         print("🔎 Scraping ESPN injuries...")
@@ -1244,12 +1761,140 @@ def main():
         print(f"  → got {len(injuries)} injury entries")
 
     print("🔎 Generating projections (this may take a minute)...")
-    df = model.run(save_csv=args.out, injuries=injuries, n_sims=args.n_sims)
+    
+    df = model.run(
+        save_csv=args.out,
+        injuries=injuries,
+        n_sims=args.n_sims
+    )
     if df.empty:
         print("❌ No projections created.")
-    else:
-        print("✅ Done — top 10 projections:")
-        print(df.head(10).to_string(index=False))
+        return
+
+    if args.optimize == "gpp-multi":
+        print("\n🧠 Generating multiple GPP lineups...")
+
+        # Ensure base objective exists
+        if "OBJ" not in df.columns:
+            df["OBJ"] = (
+                0.55 * df["Projection"] +
+                0.35 * df["Ceiling_MC"] +
+                0.10 * df["GPP_Alpha"]
+            )
+
+        # -------------------------
+        # 1️⃣ Generate lineups
+        # -------------------------
+        lineups = generate_gpp_lineups_recycling(
+            df=df,
+            n_lineups=50,
+            cash_threshold=0.55
+        )
+
+        # -------------------------
+        # 2️⃣ Player-level dataframe
+        # -------------------------
+        all_players = pd.concat(lineups, ignore_index=True)
+
+        # -------------------------
+        # 3️⃣ Evaluate lineups (MC)
+        # -------------------------
+        summary = evaluate_lineups_mc(lineups)
+
+        summary = summary.rename(columns={
+            "Mean": "Lineup_Mean",
+            "P90": "Lineup_P90",
+            "P95": "Lineup_P95",
+            "P99": "Lineup_P99",
+        })
+
+        # -------------------------
+        # 4️⃣ Filter GOOD lineups
+        # -------------------------
+        summary = summary[summary["P_Cash"] >= 0.55]
+
+        if summary.empty:
+            print("❌ No lineups passed P_Cash filter.")
+            return
+
+        # -------------------------
+        # 5️⃣ Merge lineup stats → players
+        # -------------------------
+        all_players = all_players.merge(
+            summary,
+            left_on="Lineup",
+            right_index=True,
+            how="inner"
+        )
+
+        # -------------------------
+        # 6️⃣ Lineup summary table
+        # -------------------------
+        lineup_summary = (
+            all_players.groupby("Lineup")
+            .agg(
+                Salary=("Salary", "sum"),
+                Proj=("Projection", "sum"),
+                Lineup_Mean=("Lineup_Mean", "first"),
+                Lineup_P90=("Lineup_P90", "first"),
+                Lineup_P95=("Lineup_P95", "first"),
+                Lineup_P99=("Lineup_P99", "first"),
+                P_Cash=("P_Cash", "first"),
+                P_Top1=("P_Top1", "first"),
+            )
+            .sort_values("P_Top1", ascending=False)
+        )
+
+        # -------------------------
+        # 7️⃣ Output
+        # -------------------------
+        print("\n📊 LINEUP EVALUATION (Filtered)")
+        print(lineup_summary.head(10).round(3))
+
+        lineup_summary.to_csv("lineup_summary.csv", float_format="%.4f")
+        all_players.to_csv(args.lineup_out, index=False)
+
+        # -------------------------
+        # 8️⃣ Visuals
+        # -------------------------
+        plot_ceiling_vs_projection(df)
+        plot_salary_distribution(lineups)
+        plot_player_exposure(lineups)
+
+        print(f"\n✅ Saved {len(lineup_summary)} filtered lineups")
+        return
+
+    print("✅ Done — top 10 projections:")
+    print(df.head(10).to_string(index=False))
+
+    # -------------------------
+    # Optional lineup optimizer
+    # -------------------------
+    if args.optimize:
+        print(f"\n🧠 Optimizing DraftKings lineup ({args.optimize.upper()})...")
+
+        lineup = optimize_dk_lineup(
+            df=df,
+            mode=args.optimize,
+            min_core=2 if args.optimize == 'gpp' else 0,
+            max_sprinkle=2
+        )
+
+        if lineup.empty:
+            print("❌ Optimizer failed to produce a lineup.")
+        else:
+            lineup.to_csv(args.lineup_out, index=False)
+
+            print("\n🏀 OPTIMIZED LINEUP")
+            print(
+                lineup[
+                    ['Name', 'Team', 'Position', 'Salary',
+                     'Projection', 'Ceiling_MC', 'GPP_Tier']
+                ].to_string(index=False)
+            )
+
+            print(f"\n💾 Lineup saved to: {args.lineup_out}")
 
 if __name__ == "__main__":
     main()
+

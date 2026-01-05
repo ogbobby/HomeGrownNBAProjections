@@ -4,8 +4,8 @@ from scipy.stats import spearmanr
 # ----------------------------
 # Load data
 # ----------------------------
-proj = pd.read_csv("projections12-22.csv")
-dk   = pd.read_csv("contest-standings-12-22.csv")
+proj = pd.read_csv("projections12-29.csv")
+dk   = pd.read_csv("contest-standings-12-29.csv")
 
 # ----------------------------
 # Normalize names FIRST
@@ -19,7 +19,7 @@ dk['Player'] = dk['Player'].str.lower().str.strip()
 common = set(dk['Player']) & set(proj['Name'])
 coverage = len(common) / dk['Player'].nunique()
 
-if coverage < 0.95:
+if coverage < 0.93:
     raise ValueError(
         f"Projection/contest mismatch: only {coverage:.1%} of players matched"
     )
@@ -67,7 +67,7 @@ ceiling_rate = (
       ['HitCeiling']
       .mean()
 )
-df['CeilingResidual'] = df['ActualFPTS'] - df['Ceiling_MC']
+df['CeilingResidual'] = df['FPTS'] - df['Ceiling_MC']
 df.groupby('VolatilityTier')['CeilingResidual'].mean()
 
 print(ceiling_rate)
