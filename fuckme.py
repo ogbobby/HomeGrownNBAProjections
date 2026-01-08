@@ -18,6 +18,7 @@ import re
 import unicodedata
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,8 @@ from getVegas import get_nba_odds
 # -------------------------
 # Config / constants
 # -------------------------
+exposure = Counter()
+max_exposure = 0.55  # 55% cap
 VEGAS_DEFAULT_TOTAL = 112.0
 VEGAS_DEFAULT_SPREAD = 0.0
 
@@ -549,13 +552,25 @@ def monte_carlo_per_stat(
         'std': float(np.std(sims, ddof=1)),
         'sims': sims
     }
-def evaluate_lineup_mc(lineup, n_sims=3000):
-    # Stack player sims
+
+def evaluate_lineup_mc(
+    lineup,
+    n_sims=3000,
+    field_size=20000,
+    cash_rate=0.18,
+):
+    """
+    Monte Carlo evaluation of a lineup against a simulated field.
+    """
+
+    # -------------------------
+    # 1️⃣ Sim lineup outcome
+    # -------------------------
     sims = []
 
     for _, p in lineup.iterrows():
         if "MC_Mean" not in p or "Volatility_STD" not in p:
-            return None  # invalid lineup
+            return None
 
         sims.append(
             np.random.normal(
@@ -567,44 +582,73 @@ def evaluate_lineup_mc(lineup, n_sims=3000):
 
     lineup_sims = np.sum(sims, axis=0)
 
+    # -------------------------
+    # 2️⃣ Sim field outcomes
+    # -------------------------
+    # Field distribution — rough but realistic
+    field_sims = np.random.normal(
+        loc=255,     # avg DK lineup
+        scale=18,    # slate volatility
+        size=(n_sims, field_size)
+    )
+
+    # -------------------------
+    # 3️⃣ Compute cut lines
+    # -------------------------
+    cash_cutoff = np.percentile(
+        field_sims,
+        100 * (1 - cash_rate),
+        axis=1
+    )
+
+    top1_cutoff = field_sims.max(axis=1)
+
+    # -------------------------
+    # 4️⃣ Probabilities
+    # -------------------------
+    P_Cash = np.mean(lineup_sims >= cash_cutoff)
+    #P_Top1 = np.mean(lineup_sims >= top1_cutoff)
+    P_Top1 = (
+    0.5 * np.mean(lineup_sims >= 320) +
+    0.5 * np.mean(lineup_sims >= 335)
+    )
+
+    # -------------------------
+    # 5️⃣ Return stats
+    # -------------------------
     return {
-        "Mean": lineup_sims.mean(),
+        "Lineup_Mean": lineup_sims.mean(),
         "P90": np.percentile(lineup_sims, 90),
         "P95": np.percentile(lineup_sims, 95),
         "P99": np.percentile(lineup_sims, 99),
-        "P_Cash": np.mean(lineup_sims >= 280),
-        "P_Top1": np.mean(lineup_sims >= 330),
+        "P_Cash": P_Cash,
+        "P_Top1": P_Top1,
     }
-
-#def evaluate_lineup_mc(
-#    lineup: pd.DataFrame,
-#    n_sims: int = 5000,
-#    cash_line: float = 270.0,     # adjust per slate
-#    rng: np.random.Generator | None = None
-#) -> dict:
-#
-#    if rng is None:
-#        rng = np.random.default_rng()
-#
-#    # Pull per-player distribution params
-#    means = lineup["MC_Mean"].values
-#    stds  = lineup["Volatility_STD"].values
-#
+#def evaluate_lineup_mc(lineup, n_sims=3000):
+#    # Stack player sims
 #    sims = []
 #
-#    for _ in range(n_sims):
-#        draw = rng.normal(means, stds)
-#        sims.append(draw.sum())
+#    for _, p in lineup.iterrows():
+#        if "MC_Mean" not in p or "Volatility_STD" not in p:
+#            return None  # invalid lineup
 #
-#    sims = np.array(sims)
+#        sims.append(
+#            np.random.normal(
+#                loc=p["MC_Mean"],
+#                scale=p["Volatility_STD"],
+#                size=n_sims
+#            )
+#        )
+#
+#    lineup_sims = np.sum(sims, axis=0)
 #
 #    return {
-#        "Lineup_Mean": float(np.mean(sims)),
-#        "Lineup_P90": float(np.percentile(sims, 90)),
-#        "Lineup_P95": float(np.percentile(sims, 95)),
-#        "Lineup_P99": float(np.percentile(sims, 99)),
-#        "P_Cash": float(np.mean(sims >= cash_line)),
-#        "P_Top1": float(np.mean(sims >= np.percentile(sims, 99)))
+#        "Mean": lineup_sims.mean(),
+#        "P90": np.percentile(lineup_sims, 90),
+#        "P95": np.percentile(lineup_sims, 95),
+#        "P99": np.percentile(lineup_sims, 99),
+#        "P_Cash": np.mean(lineup_sims >= 280),
+#        "P_Top1": np.mean(lineup_sims >= 330),
 #    }
 
 def score_lineup(lineup: pd.DataFrame) -> dict:
@@ -614,6 +658,7 @@ def score_lineup(lineup: pd.DataFrame) -> dict:
         "LineupFloor": lineup["Floor_MC"].sum(),
         "LineupSalary": lineup["Salary"].sum()
     }
+
 def evaluate_lineups_mc(lineups):
     rows = []
 
@@ -621,15 +666,21 @@ def evaluate_lineups_mc(lineups):
         stats = evaluate_lineup_mc(lineup)
 
         if stats is None:
-            #continue  # 🔑 THIS IS THE KEY
-            print("⚠️ evaluate_lineup_mc returned None")
+            print(f"⚠️ Lineup {i} returned None")
+            continue
 
-        row = stats.to_dict() if isinstance(stats, pd.Series) else dict(stats)
+        # normalize stats dict
+        row = dict(stats)
+
+        # 🔑 STANDARDIZE COLUMN NAMES
+        if "Mean" in row and "Lineup_Mean" not in row:
+            row["Lineup_Mean"] = row.pop("Mean")
+
         row["Lineup"] = i
         rows.append(row)
 
     if not rows:
-        print("❌ No lineups survived evaluate_lineup_mc()")
+        print("❌ No lineups survived evaluate_lineups_mc()")
         return pd.DataFrame()
 
     return pd.DataFrame(rows).set_index("Lineup")
@@ -640,33 +691,98 @@ def evaluate_lineups_mc(lineups):
 #    for i, lineup in enumerate(lineups, start=1):
 #        stats = evaluate_lineup_mc(lineup)
 #
-#        row = stats.to_dict() if isinstance(stats, pd.Series) else dict(stats)
-#        row["Lineup"] = i
+#        if stats is None:
+#            print(f"⚠️ Lineup {i}: evaluate_lineup_mc returned None")
+#            continue
+#
+#        # Normalize to dict
+#        if isinstance(stats, pd.Series):
+#            stats = stats.to_dict()
+#
+#        # REQUIRED fields (ONLY what actually exists)
+#        required = ["P_Cash", "P_Top1"]
+#        missing = [k for k in required if k not in stats]
+#
+#        if missing:
+#            print(f"❌ Lineup {i} missing fields: {missing}")
+#            continue
+#
+#        row = {
+#            "Lineup": i,
+#            "P_Cash": stats["P_Cash"],
+#            "P_Top1": stats["P_Top1"],
+#        }
+#
+#        # Optional (only if present)
+#        if "Mean" in stats:
+#            row["Lineup_Mean"] = stats["Mean"]
+#        if "P90" in stats:
+#            row["Lineup_P90"] = stats["P90"]
+#        if "P95" in stats:
+#            row["Lineup_P95"] = stats["P95"]
 #
 #        rows.append(row)
 #
-#    df = pd.DataFrame(rows).set_index("Lineup")
-#    return df
-
-#def evaluate_lineups_mc(lineups: list[pd.DataFrame]) -> pd.DataFrame:
-#    """
-#    Evaluate multiple lineups using Monte Carlo.
-#    Wrapper around evaluate_lineup_mc().
-#    """
+#    if not rows:
+#        print("❌ No lineups survived evaluate_lineups_mc()")
+#        return pd.DataFrame()
 #
+#    return pd.DataFrame(rows).set_index("Lineup")
+#def evaluate_lineups_mc(lineups):
 #    rows = []
 #
 #    for i, lineup in enumerate(lineups, start=1):
 #        stats = evaluate_lineup_mc(lineup)
+#
+#        if stats is None:
+#            print(f"⚠️ Lineup {i}: evaluate_lineup_mc returned None")
+#            continue
+#
+#        # ---- REQUIRED FIELDS CHECK ----
+#        required = ["sims", "P_Cash", "P_Top1"]
+#        missing = [k for k in required if k not in stats]
+#
+#        if missing:
+#            print(f"❌ Lineup {i} missing fields: {missing}")
+#            continue
+#
+#        sims = np.asarray(stats["sims"])
+#
+#        rows.append({
+#            "Lineup": i,
+#            "Lineup_Mean": sims.mean(),
+#            "Lineup_P90": np.percentile(sims, 90),
+#            "Lineup_P95": np.percentile(sims, 95),
+#            "P_Cash": stats["P_Cash"],
+#            "P_Top1": stats["P_Top1"],
+#        })
+#
+#    if not rows:
+#        print("❌ No lineups survived evaluate_lineups_mc()")
+#        return pd.DataFrame()
+#
+#    return pd.DataFrame(rows).set_index("Lineup")
+#
+#def evaluate_lineups_mc(lineups):
+#    rows = []
+#
+#    for i, lineup in enumerate(lineups, start=1):
+#        stats = evaluate_lineup_mc(lineup)
+#
+#        if stats is None:
+#            #continue  # 🔑 THIS IS THE KEY
+#            print("⚠️ evaluate_lineup_mc returned None")
+#
 #        row = stats.to_dict() if isinstance(stats, pd.Series) else dict(stats)
 #        row["Lineup"] = i
 #        rows.append(row)
 #
-#        #stats["Lineup"] = float(i)
-#        #rows.append(stats)
+#    if not rows:
+#        print("❌ No lineups survived evaluate_lineup_mc()")
+#        return pd.DataFrame()
 #
-#    df = pd.DataFrame(rows).set_index("Lineup")
-#    return df
+#    return pd.DataFrame(rows).set_index("Lineup")
+
 # -------------------------
 # Core projection class
 # -------------------------
@@ -1742,6 +1858,55 @@ def generate_candidate_lineups(
 
     return lineups
 
+def apply_exposure_penalty(
+    df,
+    exposure,
+    target_lineups,
+    alpha=0.45,
+    power=1.5
+):
+    df = df.copy()
+
+    ceiling_norm = (
+        df["Ceiling_MC"] / df["Ceiling_MC"].max()
+    )
+
+    def adj_obj(row):
+        e = exposure[row["Name"]] / max(target_lineups, 1)
+
+        # Median-heavy chalk punished more
+        ceiling_boost = 0.6 + 0.4 * ceiling_norm.loc[row.name]
+
+        penalty = alpha * (e ** power) * ceiling_boost
+        return row["OBJ"] * (1 - penalty)
+
+    df["OBJ_adj"] = df.apply(adj_obj, axis=1)
+    return df
+
+#def apply_exposure_penalty(
+#    df,
+#    exposure,
+#    target_lineups,
+#    alpha=0.45,      # overall strength
+#    power=1.5        # curvature ( >1 = harsher late )
+#):
+#    df = df.copy()
+#
+#    def adj_obj(row):
+#        e = exposure[row["Name"]] / max(target_lineups, 1)
+#        penalty = alpha * (e ** power)
+#        return row["OBJ"] * (1 - penalty)
+#
+#    df["OBJ_adj"] = df.apply(adj_obj, axis=1)
+#    return df
+
+
+def violates_exposure(lineup, exposure, target_lineups, max_exposure=0.55):
+    for name in lineup["Name"]:
+        if exposure[name] / max(target_lineups, 1) >= max_exposure:
+            return True
+    return False
+
 def generate_gpp_lineups_recycling(
     df: pd.DataFrame,
     n_lineups: int = 20,
@@ -1755,6 +1920,9 @@ def generate_gpp_lineups_recycling(
     Always returns >=1 lineup if possible.
     """
 
+    exposure = Counter()
+    target_lineups = n_lineups      #added for tuning
+    MAX_EXPOSURE = 0.45
     kept_lineups = []
     cash_threshold = start_cash
 
@@ -1764,10 +1932,24 @@ def generate_gpp_lineups_recycling(
         # -----------------------------
         # 1️⃣ Generate raw candidates
         # -----------------------------
+        #df_adj = apply_exposure_penalty(df, exposure, target_lineups)
+        df_adj = apply_exposure_penalty(
+            df,
+            exposure,
+            target_lineups,
+            alpha=0.45,
+            power=1.5
+        )
+
         candidates = generate_candidate_lineups(
-            df=df,
+            df=df_adj,
             n_lineups=candidates_per_round,
         )
+
+        #candidates = generate_candidate_lineups(
+        #    df=df,
+        #    n_lineups=candidates_per_round,
+        #)
 
         if not candidates:
             print("⚠️ No candidate lineups generated")
@@ -1811,13 +1993,32 @@ def generate_gpp_lineups_recycling(
         for idx, row in passing.iterrows():
             lineup = candidates[int(idx) - 1]
 
-            lineup.attrs["Lineup_Mean"] = row["Mean"]
-            lineup.attrs["Lineup_P90"] = row["P90"]
-            lineup.attrs["Lineup_P95"] = row["P95"]
+            #lineup.attrs["Lineup_Mean"] = row["Mean"]
+            #lineup.attrs["Lineup_P90"] = row["P90"]
+            #lineup.attrs["Lineup_P95"] = row["P95"]
+            #lineup.attrs["P_Cash"] = row["P_Cash"]
+            #lineup.attrs["P_Top1"] = row.get("P_Top1", 0.0)
             lineup.attrs["P_Cash"] = row["P_Cash"]
-            lineup.attrs["P_Top1"] = row.get("P_Top1", 0.0)
+            lineup.attrs["P_Top1"] = row["P_Top1"]
+
+            # Optional fields (only if present)
+            if "Lineup_Mean" in row:
+                lineup.attrs["Lineup_Mean"] = row["Lineup_Mean"]
+
+            if "Lineup_P90" in row:
+                lineup.attrs["Lineup_P90"] = row["Lineup_P90"]
+
+            if "Lineup_P95" in row:
+                lineup.attrs["Lineup_P95"] = row["Lineup_P95"]
+
+            if violates_exposure(lineup, exposure, target_lineups, MAX_EXPOSURE):
+                continue  # ❌ reject lineup
 
             kept_lineups.append(lineup)
+
+            # ✅ update exposure ONLY AFTER acceptance
+            for name in lineup["Name"]:
+                exposure[name] += 1
 
         # Stop early if enough
         if len(kept_lineups) >= n_lineups:
@@ -1834,6 +2035,9 @@ def generate_gpp_lineups_recycling(
         for idx, row in best.iterrows():
             lineup = candidates[int(idx) - 1]
 
+            if violates_exposure(lineup, exposure, target_lineups, MAX_EXPOSURE):
+                continue
+            
             lineup.attrs["Lineup_Mean"] = row["Mean"]
             lineup.attrs["Lineup_P90"] = row["P90"]
             lineup.attrs["Lineup_P95"] = row["P95"]
@@ -1842,74 +2046,29 @@ def generate_gpp_lineups_recycling(
 
             kept_lineups.append(lineup)
 
+            for name in lineup["Name"]:
+                exposure[name] += 1
+
+            if len(kept_lineups) >= n_lineups:
+                break
+
+        #for idx, row in best.iterrows():
+        #    lineup = candidates[int(idx) - 1]
+#
+        #    lineup.attrs["Lineup_Mean"] = row["Mean"]
+        #    lineup.attrs["Lineup_P90"] = row["P90"]
+        #    lineup.attrs["Lineup_P95"] = row["P95"]
+        #    lineup.attrs["P_Cash"] = row["P_Cash"]
+        #    lineup.attrs["P_Top1"] = row.get("P_Top1", 0.0)
+#
+        #    kept_lineups.append(lineup)
+
     print(f"✅ Final GPP lineups kept: {len(kept_lineups)}")
+    print("\n🔎 FINAL EXPOSURE CHECK")              #delete after running 
+    for name, cnt in exposure.most_common(10):
+        print(f"{name}: {cnt / target_lineups:.1%}")
     return kept_lineups[:n_lineups]
 
-
-#def generate_gpp_lineups_recycling(
-#    df,
-#    n_lineups=50,
-#    cash_threshold=0.55,
-#    max_recycles=20,
-#):
-#    good_lineups = []
-#    all_attempts = []
-#
-#    for iteration in range(max_recycles):
-#        dynamic_cash = max(
-#            cash_threshold - 0.015 * iteration,
-#            0.30  # DFS-reality floor
-#        )
-#
-#        print(
-#            f"🔁 Recycling {iteration+1}/{max_recycles} "
-#            f"(cash >= {dynamic_cash:.3f})"
-#        )
-#
-#        # 1️⃣ Generate candidates
-#        candidates = generate_candidate_lineups(
-#            df,
-#            n_lineups=n_lineups * 2
-#        )
-#
-#        # 2️⃣ Evaluate ONCE
-#        evaluated = evaluate_lineups_mc(candidates)
-#
-#        # 3️⃣ Attach attrs so we don't re-sim
-#        for i, lineup in enumerate(candidates):
-#            for col in evaluated.columns:
-#                lineup.attrs[col] = evaluated.iloc[i][col]
-#
-#        # 4️⃣ Save all attempts
-#        all_attempts.extend(candidates)
-#
-#        # 5️⃣ Filter passing
-#        passing = [
-#            l for l in candidates
-#            if l.attrs["P_Cash"] >= dynamic_cash
-#        ]
-#
-#        good_lineups.extend(passing)
-#        good_lineups = dedupe_lineups(good_lineups)
-#        if passing.empty:
-#            # Fallback: keep top N by GPP score
-#            passing = evaluated.sort_values(
-#                "GPP_OBJ", ascending=False
-#            ).head(5)
-#
-#        if len(good_lineups) >= n_lineups:
-#            break
-#
-#    # 🧯 FAILSAFE — never return empty
-#    if len(good_lineups) == 0:
-#        print("⚠️ No lineups met cash threshold — using best available")
-#        good_lineups = sorted(
-#            all_attempts,
-#            key=lambda l: l.attrs["P_Top1"],
-#            reverse=True
-#        )[:n_lineups]
-#
-#    return good_lineups[:n_lineups]
 
 def dedupe_lineups(lineups):
     seen = set()
@@ -2153,17 +2312,25 @@ def main():
     if df.empty:
         print("❌ No projections created.")
         return
+    #-----------------------------
+    # Tuning for the win
+    #----------------------------
+    df["Pts_per_K"] = df["Projection"] / (df["Salary"] / 1000)
+    df["OwnershipAdj"] = np.clip(df["OwnershipProb"], 0.05, 0.35)
 
     if args.optimize == "gpp-multi":
         print("\n🧠 Generating multiple GPP lineups...")
+        
 
         # Ensure base objective exists
         if "OBJ" not in df.columns:
             df["OBJ"] = (
-                0.30 * df["Projection"] +
-                0.55 * df["Ceiling_MC"] +
-                0.35 * df["BoomScore"] +
-                0.30 * (1 - df["OwnershipProb"])
+                0.35 * df["Projection"] +
+                0.30 * df["Ceiling_MC"] +
+                0.20 * df["BoomScore"] +
+                0.10 * df["Floor_MC"] +
+                0.10 * df["Pts_per_K"] +
+                0.15 * (1 - df["OwnershipProb"])
             )
 
         # -------------------------
@@ -2182,23 +2349,12 @@ def main():
         # -------------------------
         # 2️⃣ Build lineup summary FROM attrs (SINGLE SOURCE)
         # -------------------------
-        #summary = pd.DataFrame(
-        #    [
-        #        {
-        #            "Lineup": i + 1,
-        #            "Salary": l.attrs["Salary"],
-        #            "Proj": l.attrs["Proj"],
-        #            "Lineup_Mean": l.attrs["Lineup_Mean"],
-        #            "Lineup_P90": l.attrs["Lineup_P90"],
-        #            "Lineup_P95": l.attrs["Lineup_P95"],
-        #            "P_Cash": l.attrs["P_Cash"],
-        #            "P_Top1": l.attrs["P_Top1"],
-        #        }
-        #        for i, l in enumerate(lineups)
-        #    ]
-        #).set_index("Lineup")
-        summary = evaluate_lineups_mc(lineups)
         
+        summary = evaluate_lineups_mc(lineups)
+        #print("DEBUG summary columns:", summary.columns.tolist())       #delete after running
+        print("SUMMARY COLUMNS:", summary.columns.tolist())  
+        print(summary.head())           #delete after running
+
         # -------------------------
         # 3️⃣ Filter + sort
         # -------------------------
@@ -2252,14 +2408,22 @@ def main():
             return
 
         summary = summary.sort_values("P_Top1", ascending=False)
+        #summary = summary.sort_values(
+        #    by=["P_Top1", "P99", "Lineup_Mean"],                    #may need deleted
+        #    ascending=False
+        #)
+
 
         print("\n📊 TOP LINEUPS")
         print(summary.head(10).round(3))
 
         summary.to_csv("lineup_summary.csv", float_format="%.4f")
         print("\n📊 LINEUP EVALUATION (Top 10)")
-        print(summary.head(10).round(3))
-
+        #print(summary.head(10).round(3))
+        cols = [c for c in ["P_Cash", "P_Top1", "Lineup_Mean"] if c in summary.columns]
+        print(summary[cols].describe().round(3))
+        print("\n📈 POST-TUNING DISTRIBUTION")
+        print(summary[["P_Cash", "P_Top1", "Lineup_Mean"]].describe().round(3))    #delete after run
         # -------------------------
         # 6️⃣ Visuals
         # -------------------------

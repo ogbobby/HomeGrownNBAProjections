@@ -170,4 +170,3 @@ def get_nba_odds():
         import traceback
         traceback.print_exc()
         return []
-    
