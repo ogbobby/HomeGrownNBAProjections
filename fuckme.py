@@ -86,6 +86,7 @@ VOLATILITY_MULTIPLIER = {
     "MED": 1.0,
     "LOW": 0.85
 }
+
 BIAS_CORRECTION = 1.045
 DK_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
 
@@ -319,7 +320,7 @@ def correlated_stat_draw(row, rng):   #just added 12-16
         'BLK': max(0, blk),
         'TOV': max(0, tov),
     }
-def estimate_ownership(df):                     #Function added 12-16
+def estimate_ownership(df):                     
     """
     Estimate ownership % using salary and projection ranks.
     Output is roughly calibrated to DK large-field GPPs.
@@ -353,6 +354,36 @@ def salary_bias(salary):
         return 0.6
     return 0.3  # expensive stars
 
+def build_field_sims(n_sims, field_size):
+    field_core = np.random.normal(
+        loc=268,        #strength of field lineups tuneable
+        scale=30,           #field variance tuneable
+        size=(n_sims, field_size)
+    )
+
+    tail_mask = np.random.binomial(1, 0.055, field_core.shape)       #was 0.08
+    tail_boost = tail_mask * np.random.normal(25, 10, field_core.shape)
+
+    field_sims = field_core + tail_boost
+    field_sims = np.clip(field_sims, 150, 360)
+
+    # Softer cash field
+    field_cash = np.clip(
+        np.random.normal(
+            loc=236,
+            scale=20,
+            size=field_core.shape
+        ),
+        180,
+        320
+    )
+
+    return field_sims, field_cash
+
+FIELD_CACHE = build_field_sims(
+    n_sims=3000,
+    field_size=20000
+)
 # -------------------------
 # Position-based usage context and redistribution
 # -------------------------
@@ -555,66 +586,177 @@ def monte_carlo_per_stat(
 
 def evaluate_lineup_mc(
     lineup,
+    field_sims,
+    field_cash,
     n_sims=3000,
     field_size=20000,
     cash_rate=0.18,
 ):
     """
-    Monte Carlo evaluation of a lineup against a simulated field.
+    Monte Carlo evaluation of a lineup vs simulated field
     """
 
     # -------------------------
-    # 1️⃣ Sim lineup outcome
+    # 1️⃣ Simulate lineup outcome
     # -------------------------
     sims = []
 
-    for _, p in lineup.iterrows():
+    teams = lineup["Team"].values
+    games = (
+        lineup["Team"].astype(str) + "_" + lineup["Opponent"].astype(str)
+        if "Opponent" in lineup.columns
+        else None
+    )
+
+    for i, (_, p) in enumerate(lineup.iterrows()):
+    #for _, p in lineup.iterrows():
         if "MC_Mean" not in p or "Volatility_STD" not in p:
             return None
 
-        sims.append(
-            np.random.normal(
-                loc=p["MC_Mean"],
-                scale=p["Volatility_STD"],
-                size=n_sims
-            )
+        vol = p["Volatility_STD"]
+        same_game = (
+            np.sum(games == games.iloc[i])
+            if games is not None
+            else 0
         )
 
+        # Team correlation
+        same_team = np.sum(teams == p["Team"])
+        if same_team >= 2:
+            vol *= 1 + 0.22 * (same_team - 1)
+
+        if same_game >= 3:
+            vol *= 1 + 0.18 * (same_game - 2)
+
+        player_sims = np.random.normal(
+            loc=p["MC_Mean"],
+            scale=vol,
+            size=n_sims
+        )
+
+        # 🔥 asymmetric upside skew (only for correlated stacks)
+        #if same_team >= 2 or same_game >= 3:
+        #    player_sims += np.random.gamma(
+        #        shape=2.0,
+        #        scale=3.5,
+        #        size=n_sims
+        #    )
+
+        #sims.append(player_sims)
+        #player_sims += np.clip(
+        #    np.random.gamma(2.0, 3.5, size=n_sims),
+        #    0,
+        #    25
+        #)
+        ##if same_team >= 2 or same_game >= 3:
+        ##    player_sims += np.random.gamma(2.0, 3.0, size=n_sims)
+        ##    player_sims += np.clip(                               #Might need to restore this nd turn it down alittle more
+        ##        np.random.gamma(2.0, 3.5, size=n_sims),
+        ##        0,
+        ##        25
+        ##    )
+
+        if same_team >= 2 or same_game >= 3:
+            player_sims += np.clip(
+                np.random.gamma(1.6, 2.5, size=n_sims),
+                0,
+                12
+            )
+
+        sims.append(player_sims)
+        # 🔥 add asymmetric upside skew
+        #if same_team >= 2 or same_game >= 3:
+        #    sims[-1] += np.random.gamma(
+        #        shape=2.0,
+        #        scale=3.5,
+        #        size=n_sims
+        #    )
+        #if same_team >= 2:
+        #    vol *= 1 + 0.18 * (same_team - 1)
+
+        #sims.append(
+        #    np.random.normal(
+        #        loc=p["MC_Mean"],
+        #        scale=vol,
+        #        size=n_sims
+        #    )
+        #)
+
+    # ✅ lineup_sims is defined HERE (once)
     lineup_sims = np.sum(sims, axis=0)
 
     # -------------------------
-    # 2️⃣ Sim field outcomes
+    # 2️⃣ Simulate field outcomes
     # -------------------------
-    # Field distribution — rough but realistic
-    field_sims = np.random.normal(
-        loc=255,     # avg DK lineup
-        scale=18,    # slate volatility
-        size=(n_sims, field_size)
-    )
+    #field_core = np.random.normal(
+    #    loc=238,
+    #    scale=24,
+    #    size=(n_sims, field_size)
+    #)
+#
+    #field_noise = np.random.lognormal(
+    #    mean=0.0,
+    #    sigma=0.30,
+    #    size=(n_sims, field_size)
+    #)
+#
+    #field_sims = field_core * field_noise
+    
+    # Create a softer cash field (no extreme tails)
+    #field_cash = np.clip(
+    #    np.random.normal(
+    #        loc=236,
+    #        scale=20,
+    #        size=field_sims.shape
+    #    ),
+    #    180,
+    #    320
+    #)
+
+    # Heavy-tail upside (stacked lineups)
+    #tail_mask = np.random.binomial(1, 0.04, field_sims.shape)
+    #field_sims += tail_mask * np.random.normal(18, 8, field_sims.shape)
+#
+    #field_sims = np.clip(field_sims, 150, 350)
 
     # -------------------------
-    # 3️⃣ Compute cut lines
+    # 3️⃣ Rank lineup vs field
     # -------------------------
-    cash_cutoff = np.percentile(
-        field_sims,
-        100 * (1 - cash_rate),
-        axis=1
-    )
+    #combined = np.concatenate(
+    #    [lineup_sims.reshape(-1, 1), field_sims],
+    #    axis=1
+    #)
 
-    top1_cutoff = field_sims.max(axis=1)
+    # Descending rank (higher score = better)
+    #ranks = (-combined).argsort(axis=1)
+
+    # Rank of our lineup (column 0)
+    #lineup_ranks = np.where(ranks == 0)[1]
 
     # -------------------------
     # 4️⃣ Probabilities
     # -------------------------
-    P_Cash = np.mean(lineup_sims >= cash_cutoff)
-    #P_Top1 = np.mean(lineup_sims >= top1_cutoff)
-    P_Top1 = (
-    0.5 * np.mean(lineup_sims >= 320) +
-    0.5 * np.mean(lineup_sims >= 335)
+
+    # CASH: compete against median field
+    cash_cutoff = np.percentile(
+        field_cash,
+        100 * (1 - cash_rate),
+        axis=1
     )
+    P_Cash = np.mean(lineup_sims >= cash_cutoff)
+
+    # TOP 1: compete against full stacked field
+    top1_cutoff = field_sims.max(axis=1)
+    P_Top1 = np.mean(lineup_sims >= top1_cutoff)
+
+    # Cash cutoff
+    #cash_rank_cutoff = int((field_size + 1) * cash_rate)
+
+    #P_Cash = np.mean(lineup_ranks < cash_rank_cutoff)
+    #P_Top1 = np.mean(lineup_ranks == 0)
 
     # -------------------------
-    # 5️⃣ Return stats
+    # 4️⃣ Return stats
     # -------------------------
     return {
         "Lineup_Mean": lineup_sims.mean(),
@@ -624,32 +766,6 @@ def evaluate_lineup_mc(
         "P_Cash": P_Cash,
         "P_Top1": P_Top1,
     }
-#def evaluate_lineup_mc(lineup, n_sims=3000):
-#    # Stack player sims
-#    sims = []
-#
-#    for _, p in lineup.iterrows():
-#        if "MC_Mean" not in p or "Volatility_STD" not in p:
-#            return None  # invalid lineup
-#
-#        sims.append(
-#            np.random.normal(
-#                loc=p["MC_Mean"],
-#                scale=p["Volatility_STD"],
-#                size=n_sims
-#            )
-#        )
-#
-#    lineup_sims = np.sum(sims, axis=0)
-#
-#    return {
-#        "Mean": lineup_sims.mean(),
-#        "P90": np.percentile(lineup_sims, 90),
-#        "P95": np.percentile(lineup_sims, 95),
-#        "P99": np.percentile(lineup_sims, 99),
-#        "P_Cash": np.mean(lineup_sims >= 280),
-#        "P_Top1": np.mean(lineup_sims >= 330),
-#    }
 
 def score_lineup(lineup: pd.DataFrame) -> dict:
     return {
@@ -658,29 +774,61 @@ def score_lineup(lineup: pd.DataFrame) -> dict:
         "LineupFloor": lineup["Floor_MC"].sum(),
         "LineupSalary": lineup["Salary"].sum()
     }
-
-def evaluate_lineups_mc(lineups):
+def evaluate_lineups_mc(lineups, n_sims=3000, field_size=20000, cash_rate=0.18):
     rows = []
 
+    # -------------------------
+    # 🔥 PRE-COMPUTE FIELD ONCE
+    # -------------------------
+    field_core = np.random.normal(
+        loc=238,
+        scale=24,
+        size=(n_sims, field_size)
+    )
+
+    field_noise = np.random.lognormal(
+        mean=0.0,
+        sigma=0.30,
+        size=(n_sims, field_size)
+    )
+
+    field_sims = field_core * field_noise
+
+    field_cash = np.clip(
+        np.random.normal(
+            loc=236,
+            scale=20,
+            size=field_sims.shape
+        ),
+        180,
+        320
+    )
+
+    tail_mask = np.random.binomial(1, 0.04, field_sims.shape)
+    field_sims += tail_mask * np.random.normal(18, 8, field_sims.shape)
+    field_sims = np.clip(field_sims, 150, 350)
+
+    # -------------------------
+    # Evaluate each lineup
+    # -------------------------
     for i, lineup in enumerate(lineups, start=1):
-        stats = evaluate_lineup_mc(lineup)
+        stats = evaluate_lineup_mc(
+            lineup,
+            field_sims=field_sims,
+            field_cash=field_cash,
+            n_sims=n_sims,
+            field_size=field_size,
+            cash_rate=cash_rate,
+        )
 
         if stats is None:
-            print(f"⚠️ Lineup {i} returned None")
             continue
 
-        # normalize stats dict
         row = dict(stats)
-
-        # 🔑 STANDARDIZE COLUMN NAMES
-        if "Mean" in row and "Lineup_Mean" not in row:
-            row["Lineup_Mean"] = row.pop("Mean")
-
         row["Lineup"] = i
         rows.append(row)
 
     if not rows:
-        print("❌ No lineups survived evaluate_lineups_mc()")
         return pd.DataFrame()
 
     return pd.DataFrame(rows).set_index("Lineup")
@@ -692,93 +840,21 @@ def evaluate_lineups_mc(lineups):
 #        stats = evaluate_lineup_mc(lineup)
 #
 #        if stats is None:
-#            print(f"⚠️ Lineup {i}: evaluate_lineup_mc returned None")
+#            print(f"⚠️ Lineup {i} returned None")
 #            continue
 #
-#        # Normalize to dict
-#        if isinstance(stats, pd.Series):
-#            stats = stats.to_dict()
+#        # normalize stats dict
+#        row = dict(stats)
 #
-#        # REQUIRED fields (ONLY what actually exists)
-#        required = ["P_Cash", "P_Top1"]
-#        missing = [k for k in required if k not in stats]
+#        # 🔑 STANDARDIZE COLUMN NAMES
+#        if "Mean" in row and "Lineup_Mean" not in row:
+#            row["Lineup_Mean"] = row.pop("Mean")
 #
-#        if missing:
-#            print(f"❌ Lineup {i} missing fields: {missing}")
-#            continue
-#
-#        row = {
-#            "Lineup": i,
-#            "P_Cash": stats["P_Cash"],
-#            "P_Top1": stats["P_Top1"],
-#        }
-#
-#        # Optional (only if present)
-#        if "Mean" in stats:
-#            row["Lineup_Mean"] = stats["Mean"]
-#        if "P90" in stats:
-#            row["Lineup_P90"] = stats["P90"]
-#        if "P95" in stats:
-#            row["Lineup_P95"] = stats["P95"]
-#
-#        rows.append(row)
-#
-#    if not rows:
-#        print("❌ No lineups survived evaluate_lineups_mc()")
-#        return pd.DataFrame()
-#
-#    return pd.DataFrame(rows).set_index("Lineup")
-#def evaluate_lineups_mc(lineups):
-#    rows = []
-#
-#    for i, lineup in enumerate(lineups, start=1):
-#        stats = evaluate_lineup_mc(lineup)
-#
-#        if stats is None:
-#            print(f"⚠️ Lineup {i}: evaluate_lineup_mc returned None")
-#            continue
-#
-#        # ---- REQUIRED FIELDS CHECK ----
-#        required = ["sims", "P_Cash", "P_Top1"]
-#        missing = [k for k in required if k not in stats]
-#
-#        if missing:
-#            print(f"❌ Lineup {i} missing fields: {missing}")
-#            continue
-#
-#        sims = np.asarray(stats["sims"])
-#
-#        rows.append({
-#            "Lineup": i,
-#            "Lineup_Mean": sims.mean(),
-#            "Lineup_P90": np.percentile(sims, 90),
-#            "Lineup_P95": np.percentile(sims, 95),
-#            "P_Cash": stats["P_Cash"],
-#            "P_Top1": stats["P_Top1"],
-#        })
-#
-#    if not rows:
-#        print("❌ No lineups survived evaluate_lineups_mc()")
-#        return pd.DataFrame()
-#
-#    return pd.DataFrame(rows).set_index("Lineup")
-#
-#def evaluate_lineups_mc(lineups):
-#    rows = []
-#
-#    for i, lineup in enumerate(lineups, start=1):
-#        stats = evaluate_lineup_mc(lineup)
-#
-#        if stats is None:
-#            #continue  # 🔑 THIS IS THE KEY
-#            print("⚠️ evaluate_lineup_mc returned None")
-#
-#        row = stats.to_dict() if isinstance(stats, pd.Series) else dict(stats)
 #        row["Lineup"] = i
 #        rows.append(row)
 #
 #    if not rows:
-#        print("❌ No lineups survived evaluate_lineup_mc()")
+#        print("❌ No lineups survived evaluate_lineups_mc()")
 #        return pd.DataFrame()
 #
 #    return pd.DataFrame(rows).set_index("Lineup")
@@ -1815,7 +1891,21 @@ def generate_candidate_lineups(
                 if "OBJ" in pool.columns
                 else pool["Projection"]
             )
-            noise = np.random.lognormal(mean=0, sigma=0.30, size=len(pool))
+            # 🔥 Soft game stack bias
+            if lineup:
+                last_team = lineup[-1]["Team"]
+                weights = weights * np.where(
+                    pool["Team"] == last_team,
+                    1.12,   # tiny boost
+                    1.0
+                )
+            # Add randomness
+            sigma = 0.30
+            if slot == "UTIL":
+                sigma = 0.55   # chaos slot
+
+            noise = np.random.lognormal(mean=0, sigma=sigma, size=len(pool))
+            #noise = np.random.lognormal(mean=0, sigma=0.30, size=len(pool))
             w = weights * noise
             
             #player = pool.sample(1, weights=w)
@@ -2326,7 +2416,7 @@ def main():
         if "OBJ" not in df.columns:
             df["OBJ"] = (
                 0.35 * df["Projection"] +
-                0.30 * df["Ceiling_MC"] +
+                0.70 * df["Ceiling_MC"] +
                 0.20 * df["BoomScore"] +
                 0.10 * df["Floor_MC"] +
                 0.10 * df["Pts_per_K"] +
