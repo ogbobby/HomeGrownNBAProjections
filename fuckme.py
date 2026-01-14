@@ -384,6 +384,18 @@ FIELD_CACHE = build_field_sims(
     n_sims=3000,
     field_size=20000
 )
+
+def assign_bucket(lineup_df):
+    avg_own = lineup_df['OwnershipProb'].mean()
+    outliers = lineup_df['OutlierEligible'].sum()
+
+    if outliers >= 2 and avg_own < 0.12:
+        return "YOLO"
+    if outliers >= 1 and avg_own < 0.15:
+        return "CHAOS"
+    if avg_own < 0.18:
+        return "ALT_STACK"
+    return "CORE"
 # -------------------------
 # Position-based usage context and redistribution
 # -------------------------
@@ -493,44 +505,6 @@ def dynamic_usage_redistribution(player_name: str, player_pos: str, fpmin: float
 
     return fpmin * (1.0 + boost)
 
-#def minutes_volatility_factor(self, stats, player_status=None):
-#    """
-#    Returns a multiplicative volatility factor based on minutes uncertainty.
-#    """
-#
-#    min_list = stats.get('min_list', [])
-#
-#    # Base estimate
-#    if len(min_list) >= 5:
-#        mean_min = float(np.mean(min_list[-5:]))
-#        std_min = float(np.std(min_list[-5:], ddof=0))
-#    elif len(min_list) >= 2:
-#        mean_min = float(np.mean(min_list))
-#        std_min = float(np.std(min_list, ddof=0))
-#    else:
-#        mean_min = 28.0
-#        std_min = 4.0
-#
-#    # Role-based risk
-#    if mean_min >= 34:
-#        risk = 0.75
-#    elif mean_min >= 28:
-#        risk = 1.0
-#    elif mean_min >= 22:
-#        risk = 1.25
-#    else:
-#        risk = 1.5
-#
-#    # Injury uncertainty
-#    if player_status in ('QUESTIONABLE', 'DOUBTFUL'):
-#        risk *= 1.30
-#
-#    # Normalize by minutes stability
-#    min_cv = std_min / max(mean_min, 10)
-#    risk *= np.clip(1.0 + min_cv, 0.9, 1.6)
-#
-#    return float(np.clip(risk, 0.7, 1.8))
-
 # -------------------------
 # Monte Carlo per-stat (for better floor/ceiling & variance)
 # -------------------------
@@ -621,23 +595,35 @@ def monte_carlo_per_stat(
         'std': float(np.std(sims, ddof=1)),
         'sims': sims
     }
-# 🚫 DO NOT MODIFY — calibrated Jan 2026
 
+def milly_score(stats, lineup_df, field_mean):
+    avg_own = lineup_df['OwnershipProb'].mean()
+    outliers = lineup_df['OutlierEligible'].sum()
+
+    return (
+        0.55 * stats['P_Top1'] +
+        0.20 * (stats['Lineup_Mean'] / field_mean) +
+        0.15 * (1 - avg_own) +
+        0.10 * min(3, outliers) / 3
+    )
+# 🚫 DO NOT MODIFY — calibrated Jan 2026
 def evaluate_lineup_mc(
     lineup,
     field_sims,
     field_cash,
-    n_sims=3000,
     field_size=20000,
+    n_sims=1500,
     cash_rate=0.18,
+    **kwargs,
 ):
     """
-    Monte Carlo evaluation of a lineup vs simulated field
+    SAFE Monte Carlo lineup evaluation.
+    Field sims are reused and never mutated.
     """
+    def _align(*arrays):
+        n = min(len(a) for a in arrays)
+        return [a[:n] for a in arrays]
 
-    # -------------------------
-    # 1️⃣ Simulate lineup outcome
-    # -------------------------
     sims = []
 
     teams = lineup["Team"].values
@@ -647,154 +633,60 @@ def evaluate_lineup_mc(
         else None
     )
 
-    avg_lineup_min = max(1.0, lineup["ProjMin"].mean())
-
     for i, (_, p) in enumerate(lineup.iterrows()):
-
-        if "MC_Mean" not in p or "Volatility_STD" not in p:
-            return None
-
+        mean = float(p["MC_Mean"])
         vol = float(p["Volatility_STD"])
 
         same_team = np.sum(teams == p["Team"])
-        same_game = (
-            np.sum(games == games[i])
-            if games is not None
-            else 0
-        )
+        same_game = np.sum(games == games[i]) if games is not None else 0
 
-        # -------------------------
-        # Correlation volatility
-        # -------------------------
         if same_team >= 2:
-            vol *= 1 + 0.22 * (same_team - 1)
-
+            vol *= 1 + 0.20 * (same_team - 1)
         if same_game >= 3:
-            vol *= 1 + 0.18 * (same_game - 2)
+            vol *= 1 + 0.15 * (same_game - 2)
 
-        # -------------------------
-        # Base simulation
-        # -------------------------
-        player_sims = np.random.normal(
-            loc=p["MC_Mean"],
-            scale=vol,
-            size=n_sims
-        )
+        player_sims = np.random.normal(mean, vol, n_sims)
 
-        # -------------------------
-        # Minutes-linked upside
-        # -------------------------
-        if p["ProjMin"] >= 32:
-            upside_sigma = min(0.6, 0.12 * (p["ProjMin"] - 30))
-            player_sims += np.random.lognormal(
-                mean=0.0,
-                sigma=upside_sigma,
-                size=n_sims
-            )
-
-        # -------------------------
-        # Correlated ceiling boost
-        # -------------------------
         if same_team >= 2 or same_game >= 3:
-            mean_boost = (
-                2.5 * (same_team - 1)
-                + 1.8 * max(0, same_game - 2)
-            )
-            player_sims += mean_boost
-            player_sims += np.random.gamma(1.8, 3.0, size=n_sims)
+            player_sims += np.random.gamma(1.6, 2.5, n_sims)
 
-        # -------------------------
-        # Rare extended run
-        # -------------------------
-        if np.random.rand() < 0.06:
-            extra_min = np.random.randint(4, 9)
-            player_sims += extra_min * (
-                p["MC_Mean"] / avg_lineup_min
-            )
-
-        # -------------------------
-        # Hard safety cap
-        # -------------------------
-        player_sims = np.clip(
-            player_sims,
-            0,
-            p["MC_Mean"] + 3.2 * vol
-        )
-
+        player_sims = np.clip(player_sims, 0, mean + 3.0 * vol)
         sims.append(player_sims)
 
-    # -------------------------
-    # 2️⃣ Aggregate lineup
-    # -------------------------
     lineup_sims = np.sum(sims, axis=0)
 
     # -------------------------
-    # 3️⃣ Field caps (ONCE)
+    # Cash
     # -------------------------
-    field_sims_capped = np.minimum(
-        field_sims,
-        312 + np.random.normal(0, 6, field_sims.shape)
-    )
-
-    # -------------------------
-    # 4️⃣ Probabilities
-    # -------------------------
-
-    # Cash (vs softer field)
     cash_cutoff = np.percentile(
         field_cash,
         100 * (1 - cash_rate),
         axis=1
     )
-    P_Cash = np.mean(lineup_sims >= cash_cutoff)
+    #P_Cash = np.mean(lineup_sims >= cash_cutoff)
+    # Align sims safely
+    n = min(len(lineup_sims), len(cash_cutoff))
 
-    # Realistic GPP winning threshold
-    field_top = np.percentile(field_sims_capped, 99.5, axis=1)
-
-    # Soft blend with lineup upside ceiling
-    lineup_ceiling = np.percentile(lineup_sims, 99)
-
-    top1_cutoff = (
-        0.75 * field_top +
-        0.25 * lineup_ceiling
+    P_Cash = np.mean(
+        lineup_sims[:n] >= cash_cutoff[:n]
     )
 
-    # Top 1 (blended extreme tail)
-    #top1_cutoff = (
-    #    0.7 * np.percentile(field_sims_capped, 99.9, axis=1) +
-    #    0.3 * np.percentile(field_sims_capped, 99.75, axis=1)
-    #)
-    #P_Top1 = np.mean(lineup_sims >= top1_cutoff)
-    # -------------------------
-    # TOP-1 (contest-winning threshold)
-    # -------------------------
 
-    # Realistic winning score band
-    field_p995 = np.percentile(field_sims_capped, 99.5, axis=1)
-    field_p99  = np.percentile(field_sims_capped, 99.0, axis=1)
+    # -------------------------
+    # GPP Win
+    # -------------------------
+    field_p995 = np.percentile(field_sims, 99.5, axis=1)
+    #contest_cutoff = field_p995 + np.random.normal(0, 4.0, n_sims)
+    # Align MC dimensions safely
+    n = min(len(field_p995), len(lineup_sims))
 
-    contest_win_cutoff = (
-        0.55 * field_p995 +
-        0.45 * field_p99
+    contest_cutoff = (
+        field_p995[:n] +
+        np.random.normal(0, 4.0, n)
     )
 
-    # Slightly more slate chaos
-    contest_win_cutoff += np.random.normal(0, 5.0, size=n_sims)
+    P_Top1 = np.mean(lineup_sims >= contest_cutoff)
 
-    # Blend removes extreme-field dominance
-    #contest_win_cutoff = (
-    #    0.65 * field_p995 +
-    #    0.35 * field_p99
-    #)
-    #
-    ## Optional soft slate randomness (VERY IMPORTANT)
-    #contest_win_cutoff += np.random.normal(0, 3.5, size=n_sims)
-
-    P_Top1 = np.mean(lineup_sims >= contest_win_cutoff)
-
-    # -------------------------
-    # 5️⃣ Return stats
-    # -------------------------
     return {
         "Lineup_Mean": lineup_sims.mean(),
         "P90": np.percentile(lineup_sims, 90),
@@ -803,6 +695,7 @@ def evaluate_lineup_mc(
         "P_Cash": P_Cash,
         "P_Top1": P_Top1,
     }
+
 
 #def evaluate_lineup_mc(
 #    lineup,
@@ -815,6 +708,10 @@ def evaluate_lineup_mc(
 #    """
 #    Monte Carlo evaluation of a lineup vs simulated field
 #    """
+#    # Allow at most ONE extended-run event per lineup sim
+#    extended_run_mask = np.random.rand(n_sims) < 0.06
+#    field_sims = field_sims.copy()
+#    field_cash = field_cash.copy()
 #
 #    # -------------------------
 #    # 1️⃣ Simulate lineup outcome
@@ -828,103 +725,193 @@ def evaluate_lineup_mc(
 #        else None
 #    )
 #
+#    avg_lineup_min = max(1.0, lineup["ProjMin"].mean())
+#
 #    for i, (_, p) in enumerate(lineup.iterrows()):
-#    #for _, p in lineup.iterrows():
+#
 #        if "MC_Mean" not in p or "Volatility_STD" not in p:
 #            return None
 #
-#        vol = p["Volatility_STD"]
+#        vol = float(p["Volatility_STD"])
+#
+#        same_team = np.sum(teams == p["Team"])
 #        same_game = (
 #            np.sum(games == games[i])
 #            if games is not None
 #            else 0
 #        )
-#        #if same_game >= 3:
-#        #    print("GAME STACK:", games[i], same_game)
-#        # Team correlation
-#        same_team = np.sum(teams == p["Team"])
+#
+#        # -------------------------
+#        # Correlation volatility
+#        # -------------------------
 #        if same_team >= 2:
 #            vol *= 1 + 0.22 * (same_team - 1)
 #
 #        if same_game >= 3:
 #            vol *= 1 + 0.18 * (same_game - 2)
 #
+#        # -------------------------
+#        # Base simulation
+#        # -------------------------
 #        player_sims = np.random.normal(
 #            loc=p["MC_Mean"],
 #            scale=vol,
 #            size=n_sims
 #        )
-#        # -----------------------------
-#        # Minutes-linked upside kicker
-#        # -----------------------------
-#        if p["ProjMin"] >= 32:
-#            upside_scale = 0.12 * (p["ProjMin"] - 30)  # soft ramp
-#            player_sims += np.random.lognormal(
-#                mean=0.0,
-#                sigma=upside_scale,
-#                size=n_sims
-#            )
-#        player_sims = np.clip(
-#            player_sims,
-#            0,
-#            p["MC_Mean"] + 3.2 * vol
-#        )
-#        # 🔥 asymmetric upside skew (only for correlated stacks)
-#        #if same_team >= 2 or same_game >= 3:
-#        #    player_sims += np.random.gamma(
-#        #        shape=2.0,
-#        #        scale=3.5,
+#        stack_strength = max(0, same_team - 1) + 0.7 * max(0, same_game - 2)
+#        # -------------------------
+#        # Minutes-linked upside
+#        # -------------------------
+#        #if p["ProjMin"] >= 32:
+#        #    upside_sigma = min(0.6, 0.12 * (p["ProjMin"] - 30))
+#        #    player_sims += np.random.lognormal(                    #This a knob we can tune later, leave off for now
+#        #        mean=0.0,
+#        #        sigma=upside_sigma,
 #        #        size=n_sims
 #        #    )
 #
-#        #sims.append(player_sims)
-#        #player_sims += np.clip(
-#        #    np.random.gamma(2.0, 3.5, size=n_sims),
-#        #    0,
-#        #    25
-#        #)
-#        ##if same_team >= 2 or same_game >= 3:
-#        ##    player_sims += np.random.gamma(2.0, 3.0, size=n_sims)
-#        ##    player_sims += np.clip(                               #Might need to restore this nd turn it down alittle more
-#        ##        np.random.gamma(2.0, 3.5, size=n_sims),
-#        ##        0,
-#        ##        25
-#        ##    )
-#
-#        #if same_team >= 2 or same_game >= 3:
-#        #    player_sims += np.clip(
-#        #        np.random.gamma(1.6, 2.5, size=n_sims),
-#        #        0,
-#        #        12
-#        #    )
-##
-#        #sims.append(player_sims)
+#        # -------------------------
+#        # Correlated ceiling boost
+#        # -------------------------
 #        if same_team >= 2 or same_game >= 3:
 #            mean_boost = (
 #                2.5 * (same_team - 1)
 #                + 1.8 * max(0, same_game - 2)
 #            )
 #            player_sims += mean_boost
-#            player_sims += np.random.gamma(1.8, 3.0, size=n_sims)
+#            #player_sims += np.random.gamma(1.8, 3.0, size=n_sims)
+#            gamma_tail = np.random.gamma(1.8, 3.0, size=n_sims)
+#            player_sims += gamma_tail * stack_strength
 #
-#        # Rare extended run (OT / foul trouble / coach trust)
-#        if np.random.rand() < 0.06:
+#
+#        if extended_run_mask.any():
 #            extra_minutes = np.random.randint(4, 9)
-#            player_sims += extra_minutes * (p["MC_Mean"] / max(1.0, lineup["ProjMin"].mean()))
+#            player_sims[extended_run_mask] += (
+#                extra_minutes * p["MC_Mean"] / max(1.0, lineup["ProjMin"].mean())
+#            )
 #
-#        field_sims = np.minimum(
-#            field_sims,
-#            312 + np.random.normal(0, 6, field_sims.shape)
+#        # -------------------------
+#        # Rare extended run
+#        # -------------------------
+#        ##if np.random.rand() < 0.06:
+#        ##    extra_min = np.random.randint(4, 9)
+#        ##    player_sims += extra_min * (
+#        ##        p["MC_Mean"] / avg_lineup_min
+#        ##    )
+#
+#        # -------------------------
+#        # Hard safety cap
+#        # -------------------------
+#        player_sims = np.clip(
+#            player_sims,
+#            0,
+#            p["MC_Mean"] + 3.2 * vol
 #        )
 #
-#    # ✅ lineup_sims is defined HERE (once)
-#    lineup_sims = np.sum(sims, axis=0)
+#        sims.append(player_sims)
+#
+#    # -------------------------
+#    # 2️⃣ Aggregate lineup
+#    # -------------------------
+#    #lineup_sims = np.sum(sims, axis=0)         #removed vol2
+#    raw_lineup_sims = np.sum(sims, axis=0)
+#
+#    # -------------------------
+#    # CORRELATED UPSIDE SATURATION (CRITICAL FIX)
+#    # -------------------------
+#    # Prevent all players from hitting ceiling simultaneously
+#    lineup_std = np.std(raw_lineup_sims)
+#
+#    # Soft saturation curve
+#    saturation = 1 - np.exp(-raw_lineup_sims / (1.25 * raw_lineup_sims.mean()))
+#
+#    lineup_sims = (
+#        raw_lineup_sims * (0.85 + 0.15 * saturation)
+#    )
+#
+#    # Hard realism cap
+#    lineup_sims = np.minimum(
+#        lineup_sims,
+#        raw_lineup_sims.mean() + 3.1 * lineup_std
+#    )
+#
+#    # -------------------------
+#    # 3️⃣ Field caps (ONCE)
+#    # -------------------------
+#    field_sims_capped = np.minimum(
+#        field_sims,
+#        312 + np.random.normal(0, 6, field_sims.shape)
+#    )
+#
+#    # -------------------------
+#    # FIELD STACK SIMULATION (OWNERSHIP AWARE)
+#    # -------------------------
+#
+#    # Field composition
+#    chalk_stack_prob = 0.14
+#    contrarian_stack_prob = 0.04
+#
+#    chalk_mask = np.random.binomial(1, chalk_stack_prob, field_sims.shape)
+#    contrarian_mask = np.random.binomial(1, contrarian_stack_prob, field_sims.shape)
+#
+#    # Chalk stacks: frequent, capped upside
+#    field_sims += chalk_mask * np.random.normal(
+#        loc=5.0,
+#        scale=3.5,
+#        size=field_sims.shape
+#    )
+#
+#    # Contrarian stacks: rare, explosive tail
+#    field_sims += contrarian_mask * np.random.gamma(
+#        shape=2.4,
+#        scale=7.0,
+#        size=field_sims.shape
+#    )
+#
+#    # Rare slate-wide eruption (OTs, foul chaos, pace spike)
+#    field_ceiling_boost = np.random.choice(
+#        [1.0, 1.05, 1.10],
+#        p=[0.92, 0.06, 0.02]
+#    )
+#    field_sims *= field_ceiling_boost
+#    # Hard cap (realistic DK GPP ceiling)
+#    field_sims = np.clip(field_sims, 165, 355)
+#    # -------------------------
+#    # FIELD STACK SIMULATION
+#    # -------------------------
+#
+#    # Probability a field lineup is meaningfully stacked
+#    ##stack_prob = 0.18   # ~18% of lineups have real correlation
+#
+#    # Probability of game stack (more powerful)
+#    ##game_stack_prob = 0.06
+#
+#    # Sample stack masks
+#    ##stack_mask = np.random.binomial(1, stack_prob, field_sims.shape)
+#    ##game_stack_mask = np.random.binomial(1, game_stack_prob, field_sims.shape)
+#
+#    # Team stack boost (mild)
+#    ##field_sims += stack_mask * np.random.normal(
+#    ##    loc=6.0,
+#    ##    scale=4.0,
+#    ##    size=field_sims.shape
+#    ##)
+#
+#    # Game stack boost (stronger tail)
+#    ##field_sims += game_stack_mask * np.random.gamma(
+#    ##    shape=2.2,
+#    ##    scale=6.0,
+#    ##    size=field_sims.shape
+#    ##)                                               #added vol2
+#
+#    # Final sanity cap
+#    ##field_sims = np.clip(field_sims, 160, 360)
 #
 #    # -------------------------
 #    # 4️⃣ Probabilities
 #    # -------------------------
 #
-#    # CASH: compete against median field
+#    # Cash (vs softer field)
 #    cash_cutoff = np.percentile(
 #        field_cash,
 #        100 * (1 - cash_rate),
@@ -932,26 +919,52 @@ def evaluate_lineup_mc(
 #    )
 #    P_Cash = np.mean(lineup_sims >= cash_cutoff)
 #
-#    # TOP 1: compete against full stacked field
-#    #top1_cutoff = field_sims.max(axis=1)
-#    #top1_cutoff = np.percentile(field_sims, 99.85, axis=1)
-#    top1_cutoff = (
-#    0.7 * np.percentile(field_sims, 99.9, axis=1) +
-#    0.3 * np.percentile(field_sims, 99.75, axis=1)
-#    )
-#    #top1_cutoff = np.percentile(field_sims, 99.92, axis=1)     #this was the suggested add
+#    # Realistic GPP winning threshold
+#    field_top = np.percentile(field_sims_capped, 99.5, axis=1)
 #
-#    P_Top1 = np.mean(lineup_sims >= top1_cutoff)
-#    if np.random.rand() < 0.002:
-#        print(
-#                "DEBUG:",
-#                lineup_sims.max(),                      #delete after running
-#                np.percentile(field_sims, 99.9)
-#            )
-#        #print(lineup_sims.max(), np.percentile(field_sims, 99.9))
-#    sims.append(player_sims)
+#    # Soft blend with lineup upside ceiling
+#    lineup_ceiling = np.percentile(lineup_sims, 99)
+#
+#    top1_cutoff = (
+#        0.75 * field_top +
+#        0.25 * lineup_ceiling
+#    )
+#
+#    # Top 1 (blended extreme tail)
+#    #top1_cutoff = (
+#    #    0.7 * np.percentile(field_sims_capped, 99.9, axis=1) +
+#    #    0.3 * np.percentile(field_sims_capped, 99.75, axis=1)
+#    #)
+#    #P_Top1 = np.mean(lineup_sims >= top1_cutoff)
 #    # -------------------------
-#    # 4️⃣ Return stats
+#    # TOP-1 (contest-winning threshold)
+#    # -------------------------
+#
+#    # Realistic winning score band
+#    field_p995 = np.percentile(field_sims_capped, 99.5, axis=1)
+#    field_p99  = np.percentile(field_sims_capped, 99.0, axis=1)
+#
+#    contest_win_cutoff = (
+#        0.55 * field_p995 +
+#        0.45 * field_p99
+#    )
+#
+#    # Slightly more slate chaos
+#    contest_win_cutoff += np.random.normal(0, 5.0, size=n_sims)
+#
+#    # Blend removes extreme-field dominance
+#    #contest_win_cutoff = (
+#    #    0.65 * field_p995 +
+#    #    0.35 * field_p99
+#    #)
+#    #
+#    ## Optional soft slate randomness (VERY IMPORTANT)
+#    #contest_win_cutoff += np.random.normal(0, 3.5, size=n_sims)
+#
+#    P_Top1 = np.mean(lineup_sims >= contest_win_cutoff)
+#
+#    # -------------------------
+#    # 5️⃣ Return stats
 #    # -------------------------
 #    return {
 #        "Lineup_Mean": lineup_sims.mean(),
@@ -971,16 +984,16 @@ def score_lineup(lineup: pd.DataFrame) -> dict:
     }
 def evaluate_lineups_mc(lineups, n_sims=3000, field_size=20000, cash_rate=0.18):
     rows = []
-
+    
     # -------------------------
     # 🔥 PRE-COMPUTE FIELD ONCE
     # -------------------------
     field_core = np.random.normal(
         loc=238,
         scale=24,
-        size=(n_sims, field_size)
+        size=(n_sims, field_size),
     )
-
+    
     #field_noise = np.random.lognormal(
     #    mean=0.0,
     #    sigma=0.22,
@@ -1033,7 +1046,11 @@ def evaluate_lineups_mc(lineups, n_sims=3000, field_size=20000, cash_rate=0.18):
             field_size=field_size,
             cash_rate=cash_rate,
         )
-
+        stats['MillyScore'] = milly_score(
+            stats,
+            lineup,
+            field_mean=np.mean(field_sims)
+        )                                               #added with milly changes
         if stats is None:
             continue
 
@@ -1045,6 +1062,7 @@ def evaluate_lineups_mc(lineups, n_sims=3000, field_size=20000, cash_rate=0.18):
         return pd.DataFrame()
 
     return pd.DataFrame(rows).set_index("Lineup")
+
 # -------------------------
 # Core projection class
 # -------------------------
@@ -1105,7 +1123,7 @@ class SimpleNBAProjection:
     
     def project_minutes_distribution(self, stats, player_status=None):
         """
-        Returns (mean_minutes, std_minutes)
+        Returns dict with mean/std/floor/ceiling
         """
 
         # --- Mean minutes (reuse your existing logic) ---
@@ -1145,7 +1163,12 @@ class SimpleNBAProjection:
         # --- Clamp for sanity ---
         std_min = np.clip(std_min, 1.5, 9.0)
 
-        return mean_min, std_min
+        return {
+            "mean": mean_min,
+            "std": std_min,
+            "floor": max(0, mean_min - 1.5 * std_min),
+            "ceiling": min(40, mean_min + 1.5 * std_min),
+        }
     
     def minutes_volatility_factor(
         self,
@@ -1191,29 +1214,6 @@ class SimpleNBAProjection:
         base_vol = np.clip(base_vol, 4.5, 11.0)
 
         return base_vol / projected_minutes
-
-        # -------------------------
-        # 2️⃣ Recent minutes variance
-        # -------------------------
-        ##if recent_min_list and len(recent_min_list) >= 3:
-        ##    min_std = np.std(recent_min_list)
-        ##    var_factor = np.clip(1 + min_std / 18, 0.9, 1.5)
-        ##else:
-        ##    var_factor = 1.10  # unknown minutes → slight risk
-
-        # -------------------------
-        # 3️⃣ Injury uncertainty
-        # -------------------------
-        ##injury_factor = 1.0
-        ##if player_status in ("QUESTIONABLE", "DOUBTFUL"):
-        ##    injury_factor = 1.25
-        ##elif player_status == "PROBABLE":
-        ##    injury_factor = 1.10
-
-        # -------------------------
-        # Final multiplier
-        # -------------------------
-        ##return np.clip(base * var_factor * injury_factor, 0.8, 1.75)
 
     def fetch_team_stats(self) -> bool:
         res = self._safe_api_call(leaguedashteamstats.LeagueDashTeamStats, season=self.season)
@@ -1398,15 +1398,15 @@ class SimpleNBAProjection:
         # map names -> player ids
         name_to_pids = {}
         for pid, g in logs.groupby('PLAYER_ID'):
-            #nm = g.iloc[0]['PLAYER_NAME'].strip()
             nm = normalize_name(g.iloc[0]['PLAYER_NAME'])
             name_to_pids.setdefault(nm.lower(), []).append(int(pid))
 
         results = []
         for _, r in self.dk_df.iterrows():
-            player_status = None  # ✅ ALWAYS defined
+            #player_status = None  # ✅ ALWAYS defined          #removed in vol1 of new projections
             name = r['Name'].strip()
             name_l = normalize_name(name)
+            player_status = injuries.get(name_l)
             salary = float(r['Salary'])
             team = r.get('Team', None)
             pos = r.get('Position', '')
@@ -1422,76 +1422,52 @@ class SimpleNBAProjection:
             # fallback: use trimmed mean if zero-ish
             if not np.isfinite(fpmin) or fpmin <= 0:
                 fpmin = float(np.mean(stats.get('fp_min_list', [0.5])))
-            base_min = self.project_minutes(stats)
-            min_mean, min_std = self.project_minutes_distribution(
+            base_min = self.project_minutes(stats)                 #removed in vol1 of new projections
+            if player_status:
+                base_min = apply_injury_minutes_adjustment(base_min, player_status)
+            #min_mean, min_std = self.project_minutes_distribution(
+            #    stats,
+            #    player_status=player_status                    #removed in vol1 of new projections
+            #)
+            min_proj = self.project_minutes_distribution(
                 stats,
                 player_status=player_status
             )
             # injury minutes adjustment (if player himself has injury status)
-            player_status = injuries.get(name_l)
-            if player_status:
-                base_min = apply_injury_minutes_adjustment(base_min, player_status)
+            #player_status = injuries.get(name_l)           #removed in vol1 of new projections
+            Min_Mean = min_proj["mean"]
+            Min_STD = min_proj["std"]
             # -------------------------
             # MINUTES MODEL (EXPLICIT)
             # -------------------------                 ##added for new projection additions
 
-            Min_Mean = base_min
+            #Min_Mean = base_min            #removed in vol1 of new projections
 
             # Minutes volatility driven by role + history
-            min_list = stats.get('min_list', [])
-
-            if len(min_list) >= 5:
-                Min_STD = np.std(min_list, ddof=0)
-            else:
-                # fallback by role
-                Min_STD = 4.0 if Min_Mean >= 30 else 6.0
-
-            # Injury sensitivity
-            if player_status in ('QUESTIONABLE', 'DOUBTFUL'):
-                Min_STD *= 1.35
-            elif player_status == 'OUT':
-                Min_STD = 0.0
-
-            # Clamp realism
-            Min_STD = np.clip(Min_STD, 2.0, 10.0)
+            #min_list = stats.get('min_list', [])
+#
+            #if len(min_list) >= 5:
+            #    Min_STD = np.std(min_list, ddof=0)
+            #else:
+            #    # fallback by role
+            #    Min_STD = 4.0 if Min_Mean >= 30 else 6.0
+#
+            ## Injury sensitivity
+            #if player_status in ('QUESTIONABLE', 'DOUBTFUL'):          #removed in vol1 of new projections
+            #    Min_STD *= 1.35
+            #elif player_status == 'OUT':
+            #    Min_STD = 0.0
+#
+            ## Clamp realism
+            #Min_STD = np.clip(Min_STD, 2.0, 10.0)
 
             Min_Sims = np.random.normal(
                 loc=Min_Mean,
                 scale=Min_STD,
                 size=n_sims
-            )
+            ).clip(0, 48)
 
-            # 🔥 GPP-only minutes tail (STACK-DEPENDENT)
-            #if (same_team >= 2) or (same_game >= 3):
-            #    tail_mask = np.random.binomial(1, 0.22, size=n_sims)
-            #    Min_Sims += tail_mask * np.random.gamma(
-            #        shape=2.2,
-            #        scale=2.8,
-            #        size=n_sims
-            #    )
-
-            # 🔥 GPP-only minutes tail (stack benefit)
-            #if Min_Mean >= 32:
-            #    tail_mask = np.random.binomial(1, 0.18, size=n_sims)
-            #    Min_Sims += tail_mask * np.random.gamma(
-            #        shape=2.0,
-            #        scale=2.5,
-            #        size=n_sims
-            #    )
-
-            Min_Sims = Min_Sims.clip(0, 48)
-
-            # Pre-sim minutes ONCE
-            #Min_Sims = np.random.normal(
-            #    loc=Min_Mean,
-            #    scale=Min_STD,
-            #    size=n_sims
-            #).clip(0, 48)                           #end of block
-
-            # injury minutes adjustment (if player himself has injury status)
-            #player_status = injuries.get(name_l)
-            #if player_status:
-            #    base_min = apply_injury_minutes_adjustment(base_min, player_status)
+            #Min_Sims = Min_Sims.clip(0, 48)
             # dynamic usage redistribution based on team injuries & position
             team = normalize_team(r['Team'])
             matchup_mult = self.matchup_multiplier(team) if team else 1.0
@@ -1499,17 +1475,11 @@ class SimpleNBAProjection:
             fpmin = dynamic_usage_redistribution(name, pos, fpmin, base_min, injuries, self.dk_df)
             # matchup & vegas multipliers
             mult = matchup_mult * vegas_mult
-            #raw_proj = fpmin * base_min * mult ###Old line THis is to change rawprojection so it show projection before adding multiplier
             raw_proj = fpmin * base_min
             proj_with_mult = raw_proj * mult
             fp_min_list = stats.get('fp_min_list', [])  #added 12-16
             vol_tier = classify_volatility(fp_min_list)     #added 12-16
-            #capped_proj = self.cap_projection_by_salary(raw_proj, salary) ###old line THis is to change rawprojection so it show projection before adding multiplier
             capped_proj = self.cap_projection_by_salary(proj_with_mult, salary)
-            # Monte Carlo per-minute floor/ceiling: use empirical fp_min_list and min_list
-            #mc_simple = self.monte_carlo(fp_min_list=stats.get('fp_min_list', []),
-            #                             min_list=stats.get('min_list', []),
-            #                             matchup_mult=matchup_mult, projected_minutes=base_min, vegas_mult=vegas_mult, n_sims=n_sims)
             fpmin_sims = np.random.normal(
                 loc=fpmin,
                 scale=np.std(stats.get('fp_min_list', [fpmin]), ddof=0),        #added with new projection changes
@@ -1525,13 +1495,13 @@ class SimpleNBAProjection:
             mc_mean = mc_points.mean()
             volatility = mc_points.std(ddof=0)
             
-            min_vol_factor = self.minutes_volatility_factor(            #added with new projections
-                projected_minutes=base_min,
-                recent_min_list=stats.get('min_list', []),
-                player_status=player_status
-            )
-
-            volatility *= min_vol_factor
+            #min_vol_factor = self.minutes_volatility_factor(            #added with new projections
+            #    projected_minutes=base_min,
+            #    recent_min_list=stats.get('min_list', []),
+            #    player_status=player_status                    #removed with new projections
+            #)
+#
+            #volatility *= min_vol_factor
 
             floor = np.percentile(mc_points, 20)
             ceiling = np.percentile(mc_points, 90)
@@ -1542,23 +1512,9 @@ class SimpleNBAProjection:
             ceil_stat  = per_stat_mc['ceiling']
             mc_mean    = per_stat_mc['mean']
             sims       = per_stat_mc['sims']
-
-            #floor = max(
-            #    0.65 * mc_simple['floor'] + 0.35 * floor_stat,
-            #    0.0
-            #)
-            #ceiling = max(
-            #    0.35 * mc_simple['ceiling'] + 0.65 * ceil_stat,
-            #    0.0
-            #)
-            #volatility = mc_simple.get('volatility_std', 0.0)
-            #mc_mean = mc_simple.get('mean', fpmin * base_min)
             mean_proj = capped_proj                 #added 12-16
             std = volatility                    #added 12-16
             vol_tier = classify_volatility(stats.get('fp_min_list', []))       #added 12-16
-            #sims = mc_simple.get('sims', np.array([]))    #added 12-16
-
-
             p_6x = float(np.mean(sims >= salary * 0.006)) if sims.size else 0.0     #added 12-16
             p_8x = float(np.mean(sims >= salary * 0.008)) if sims.size else 0.0     #added 12-16
 
@@ -1644,9 +1600,9 @@ class SimpleNBAProjection:
         out_df['MinFactor'] = np.clip(
             36 / out_df['ProjMin'],
             0.85,
-            1.25
+            1.25                       #removed in vol1 of new projections
         )
-
+#
         out_df['Volatility_STD_adj'] = (
             out_df['Volatility_STD'] * out_df['MinFactor']
         )
@@ -1933,6 +1889,21 @@ class SimpleNBAProjection:
         out_df.loc[out_df['Salary'] < 8500, 'GPP_Tier'] = out_df.loc[out_df['Salary'] < 8500, 'GPP_Tier'].apply(
             lambda x: 'Mini-Sprinkle' if x != 'Core' else x
         )
+        # ============================
+        # MILLY OUTLIER ELIGIBILITY
+        # ============================
+
+        out_df['OutlierEligible'] = (
+            (out_df['P_8x'] >= 0.08) &
+            (out_df['Ceiling_MC'] >= 1.6 * out_df['Projection']) &      
+            (out_df['ProjMin'] >= 24) &
+            (out_df['OwnershipProb'] <= 0.15)
+        )
+
+        out_df['StackEligible'] = (
+            (out_df['Ceiling_MC'] >= 1.45 * out_df['Projection']) &
+            (out_df['ProjMin'] >= 26)
+        )                                       ##added with milly projection changes
 
         # Drop temp column 
         out_df.drop(columns=['BoomPct'], inplace=True)
@@ -2067,6 +2038,8 @@ def optimize_dk_lineup(
 
 def generate_gpp_lineups(
     df: pd.DataFrame,
+    field_sims,
+    field_cash,
     n_lineups: int = 50,
     max_exposure: float = 0.4,
     salary_cap: int = 50000,
@@ -2141,6 +2114,8 @@ def generate_gpp_lineups(
         prev_lineups.append(list(lineup['PlayerID']))
         mc = evaluate_lineup_mc(
             lineup,
+            field_sims=field_sims,
+            field_cash=field_cash,
             n_sims=3000,
             cash_line=270,   # tune per slate size
             rng=rng
@@ -2312,149 +2287,256 @@ def violates_exposure(lineup, exposure, target_lineups, max_exposure=0.55):
     return False
 
 def generate_gpp_lineups_recycling(
-    df: pd.DataFrame,
-    n_lineups: int = 20,
-    max_recycles: int = 20,
-    start_cash: float = 0.48,
-    cash_decay: float = 0.015,
-    candidates_per_round: int = 200,
+    df,
+    field_sims,
+    field_cash,
+    n_lineups=50,
+    max_exposure=0.4,
+    salary_cap=50000,
+    seed=42,
+    start_cash=None,   # ✅ absorb legacy arg
+    **kwargs 
 ):
     """
-    Robust GPP lineup recycling with safe fallbacks.
-    Always returns >=1 lineup if possible.
+    SAFE + FAST GPP lineup generator with MC evaluation.
+    Field sims are reused (CRITICAL for performance).
     """
+    rng = np.random.default_rng(seed)
+    lineups = []
+    exposure = defaultdict(int)
+    max_appearances = int(n_lineups * max_exposure)
 
-    exposure = Counter()
-    target_lineups = n_lineups      #added for tuning
-    MAX_EXPOSURE = 0.45
-    kept_lineups = []
-    cash_threshold = start_cash
+    for i in range(n_lineups):
+        print(f"🔁 Recycling {i+1}/{n_lineups}")
 
-    for recycle in range(1, max_recycles + 1):
-        print(f"🔁 Recycling {recycle}/{max_recycles} (cash >= {cash_threshold:.3f})")
+        df_iter = df.copy()
 
-        # -----------------------------
-        # 1️⃣ Generate raw candidates
-        # -----------------------------
-        #df_adj = apply_exposure_penalty(df, exposure, target_lineups)
-        df_adj = apply_exposure_penalty(
-            df,
-            exposure,
-            target_lineups,
-            alpha=0.45,
-            power=1.5
-        )
+        # -------------------------
+        # Exposure control
+        # -------------------------
+        for pid, cnt in exposure.items():
+            if cnt >= max_appearances:
+                df_iter = df_iter[df_iter["PlayerID"] != pid]
 
-        candidates = generate_candidate_lineups(
-            df=df_adj,
-            n_lineups=candidates_per_round,
-        )
-
-        #candidates = generate_candidate_lineups(
-        #    df=df,
-        #    n_lineups=candidates_per_round,
-        #)
-
-        if not candidates:
-            print("⚠️ No candidate lineups generated")
-            cash_threshold -= cash_decay
+        if len(df_iter) < 20:
             continue
 
-        # -----------------------------
-        # 2️⃣ Evaluate candidates
-        # -----------------------------
-        eval_df = evaluate_lineups_mc(candidates)
+        # -------------------------
+        # Objective (NO explosions)
+        # -------------------------
+        df_iter["OBJ"] = (
+            0.55 * df_iter["Projection"] +
+            0.30 * df_iter["Ceiling_MC"] +
+            0.15 * df_iter["GPP_Alpha"]
+        )
+        df_iter["OBJ"] *= rng.uniform(0.9, 1.1, size=len(df_iter))
 
-        if eval_df is None or eval_df.empty:
-            print("⚠️ MC evaluation returned empty")
-            cash_threshold -= cash_decay
-            continue
-
-        # -----------------------------
-        # 3️⃣ Debug visibility
-        # -----------------------------
-        print(
-            "    P_Cash:",
-            round(eval_df["P_Cash"].min(), 3),
-            #eval_df["P_Cash"].min().round(3),
-            "→",
-            round(eval_df["P_Cash"].max(), 3),
-            #eval_df["P_Cash"].max().round(3),
+        # -------------------------
+        # Build lineup
+        # -------------------------
+        lineup = optimize_dk_lineup(
+            df=df_iter,
+            salary_cap=salary_cap,
+            prev_lineups=lineups,
+            max_overlap=5,
         )
 
-        # -----------------------------
-        # 4️⃣ Filter passing lineups
-        # -----------------------------
-        passing = eval_df[eval_df["P_Cash"] >= cash_threshold]
-
-        if passing.empty:
-            cash_threshold -= cash_decay
+        if lineup is None or lineup.empty:
             continue
 
-        # -----------------------------
-        # 5️⃣ Attach attrs safely
-        # -----------------------------
-        for idx, row in passing.iterrows():
-            lineup = candidates[int(idx) - 1]
-            lineup.attrs["P_Cash"] = row["P_Cash"]
-            lineup.attrs["P_Top1"] = row["P_Top1"]
+        # -------------------------
+        # MC EVALUATION (REUSED FIELD)
+        # -------------------------
+        mc = evaluate_lineup_mc(
+            lineup,
+            field_sims=field_sims,
+            field_cash=field_cash,
+            n_sims=1500,   # ⬅️ CUT IN HALF (huge speed win)
+        )
 
-            # Optional fields (only if present)
-            if "Lineup_Mean" in row:
-                lineup.attrs["Lineup_Mean"] = row["Lineup_Mean"]
+        if mc is None:
+            continue
 
-            if "Lineup_P90" in row:
-                lineup.attrs["Lineup_P90"] = row["Lineup_P90"]
+        # -------------------------
+        # MILLY SCORE (STABLE)
+        # -------------------------
+        milly_score = (
+            0.60 * mc["P_Top1"] +
+            0.25 * (mc["P99"] / max(1.0, mc["Lineup_Mean"])) +
+            0.15 * (mc["P95"] - mc["Lineup_Mean"])
+        )
 
-            if "Lineup_P95" in row:
-                lineup.attrs["Lineup_P95"] = row["Lineup_P95"]
+        lineup = lineup.assign(
+            LineupID=i + 1,
+            Lineup_Mean=mc["Lineup_Mean"],
+            P90=mc["P90"],
+            P95=mc["P95"],
+            P99=mc["P99"],
+            P_Cash=mc["P_Cash"],
+            P_Top1=mc["P_Top1"],
+            MillyScore=milly_score,
+        )
 
-            if violates_exposure(lineup, exposure, target_lineups, MAX_EXPOSURE):
-                continue  # ❌ reject lineup
+        lineups.append(lineup)
 
-            kept_lineups.append(lineup)
+        # -------------------------
+        # Update exposure
+        # -------------------------
+        for pid in lineup["PlayerID"]:
+            exposure[pid] += 1
 
-            # ✅ update exposure ONLY AFTER acceptance
-            for name in lineup["Name"]:
-                exposure[name] += 1
+    print(f"✅ Generated {len(lineups)} lineups safely")
+    return lineups
 
-        # Stop early if enough
-        if len(kept_lineups) >= n_lineups:
-            break
-
-    # -----------------------------
-    # 6️⃣ HARD FALLBACK (CRITICAL)
-    # -----------------------------
-    if not kept_lineups:
-        print("⚠️ No lineups met cash threshold — using best available")
-
-        best = eval_df.sort_values("P_Cash", ascending=False).head(n_lineups)
-
-        for idx, row in best.iterrows():
-            lineup = candidates[int(idx) - 1]
-
-            if violates_exposure(lineup, exposure, target_lineups, MAX_EXPOSURE):
-                continue
-            
-            lineup.attrs["Lineup_Mean"] = row["Mean"]
-            lineup.attrs["Lineup_P90"] = row["P90"]
-            lineup.attrs["Lineup_P95"] = row["P95"]
-            lineup.attrs["P_Cash"] = row["P_Cash"]
-            lineup.attrs["P_Top1"] = row.get("P_Top1", 0.0)
-
-            kept_lineups.append(lineup)
-
-            for name in lineup["Name"]:
-                exposure[name] += 1
-
-            if len(kept_lineups) >= n_lineups:
-                break
-
-    print(f"✅ Final GPP lineups kept: {len(kept_lineups)}")
-    print("\n🔎 FINAL EXPOSURE CHECK")              #delete after running 
-    for name, cnt in exposure.most_common(10):
-        print(f"{name}: {cnt / target_lineups:.1%}")
-    return kept_lineups[:n_lineups]
+#def generate_gpp_lineups_recycling(
+#    df: pd.DataFrame,
+#    field_sims,
+#    field_cash,
+#    n_lineups: int = 20,
+#    max_recycles: int = 20,
+#    start_cash: float = 0.48,
+#    cash_decay: float = 0.015,
+#    candidates_per_round: int = 200,
+#):
+#    """
+#    Robust GPP lineup recycling with safe fallbacks.
+#    Always returns >=1 lineup if possible.
+#    """
+#
+#    exposure = Counter()
+#    target_lineups = n_lineups      #added for tuning
+#    MAX_EXPOSURE = 0.45
+#    kept_lineups = []
+#    cash_threshold = start_cash
+#
+#    for recycle in range(1, max_recycles + 1):
+#        print(f"🔁 Recycling {recycle}/{max_recycles} (cash >= {cash_threshold:.3f})")
+#
+#        # -----------------------------
+#        # 1️⃣ Generate raw candidates
+#        # -----------------------------
+#        #df_adj = apply_exposure_penalty(df, exposure, target_lineups)
+#        df_adj = apply_exposure_penalty(
+#            df,
+#            exposure,
+#            target_lineups,
+#            alpha=0.45,
+#            power=1.5
+#        )
+#
+#        candidates = generate_candidate_lineups(
+#            df=df_adj,
+#            n_lineups=candidates_per_round,
+#        )
+#
+#        #candidates = generate_candidate_lineups(
+#        #    df=df,
+#        #    n_lineups=candidates_per_round,
+#        #)
+#
+#        if not candidates:
+#            print("⚠️ No candidate lineups generated")
+#            cash_threshold -= cash_decay
+#            continue
+#
+#        # -----------------------------
+#        # 2️⃣ Evaluate candidates
+#        # -----------------------------
+#        eval_df = evaluate_lineups_mc(candidates)
+#
+#        if eval_df is None or eval_df.empty:
+#            print("⚠️ MC evaluation returned empty")
+#            cash_threshold -= cash_decay
+#            continue
+#
+#        # -----------------------------
+#        # 3️⃣ Debug visibility
+#        # -----------------------------
+#        print(
+#            "    P_Cash:",
+#            round(eval_df["P_Cash"].min(), 3),
+#            #eval_df["P_Cash"].min().round(3),
+#            "→",
+#            round(eval_df["P_Cash"].max(), 3),
+#            #eval_df["P_Cash"].max().round(3),
+#        )
+#
+#        # -----------------------------
+#        # 4️⃣ Filter passing lineups
+#        # -----------------------------
+#        passing = eval_df[eval_df["P_Cash"] >= cash_threshold]
+#
+#        if passing.empty:
+#            cash_threshold -= cash_decay
+#            continue
+#
+#        # -----------------------------
+#        # 5️⃣ Attach attrs safely
+#        # -----------------------------
+#        for idx, row in passing.iterrows():
+#            lineup = candidates[int(idx) - 1]
+#            lineup.attrs["P_Cash"] = row["P_Cash"]
+#            lineup.attrs["P_Top1"] = row["P_Top1"]
+#
+#            # Optional fields (only if present)
+#            if "Lineup_Mean" in row:
+#                lineup.attrs["Lineup_Mean"] = row["Lineup_Mean"]
+#
+#            if "Lineup_P90" in row:
+#                lineup.attrs["Lineup_P90"] = row["Lineup_P90"]
+#
+#            if "Lineup_P95" in row:
+#                lineup.attrs["Lineup_P95"] = row["Lineup_P95"]
+#
+#            if violates_exposure(lineup, exposure, target_lineups, MAX_EXPOSURE):
+#                continue  # ❌ reject lineup
+#
+#            kept_lineups.append(lineup)
+#
+#            # ✅ update exposure ONLY AFTER acceptance
+#            for name in lineup["Name"]:
+#                exposure[name] += 1
+#
+#        # Stop early if enough
+#        if len(kept_lineups) >= n_lineups:
+#            break
+#
+#    # -----------------------------
+#    # 6️⃣ HARD FALLBACK (CRITICAL)
+#    # -----------------------------
+#    if not kept_lineups:
+#        print("⚠️ No lineups met cash threshold — using best available")
+#
+#        best = eval_df.sort_values("P_Cash", ascending=False).head(n_lineups)
+#
+#        for idx, row in best.iterrows():
+#            lineup = candidates[int(idx) - 1]
+#
+#            if violates_exposure(lineup, exposure, target_lineups, MAX_EXPOSURE):
+#                continue
+#            
+#            lineup.attrs["Lineup_Mean"] = row["Mean"]
+#            lineup.attrs["Lineup_P90"] = row["P90"]
+#            lineup.attrs["Lineup_P95"] = row["P95"]
+#            lineup.attrs["P_Cash"] = row["P_Cash"]
+#            lineup.attrs["P_Top1"] = row.get("P_Top1", 0.0)
+#
+#            #kept_lineups.append(lineup)                #old logic, replaced with milly validation
+#            if is_valid_milly_lineup(kept_lineups):
+#                kept_lineups.append(lineup)
+#
+#
+#            for name in lineup["Name"]:
+#                exposure[name] += 1
+#
+#            if len(kept_lineups) >= n_lineups:
+#                break
+#
+#    print(f"✅ Final GPP lineups kept: {len(kept_lineups)}")
+#    print("\n🔎 FINAL EXPOSURE CHECK")              #delete after running 
+#    for name, cnt in exposure.most_common(10):
+#        print(f"{name}: {cnt / target_lineups:.1%}")
+#    return kept_lineups[:n_lineups]
 
 
 def dedupe_lineups(lineups):
@@ -2467,6 +2549,28 @@ def dedupe_lineups(lineups):
             out.append(l)
     return out
 
+def is_valid_milly_lineup(lineup_df):
+    # Team + game correlation
+    team_counts = lineup_df['Team'].value_counts()
+    game_keys = (
+        lineup_df['Team'].astype(str) + "_" +
+        lineup_df['Opponent'].astype(str)
+    )
+    game_counts = game_keys.value_counts()
+
+    # Must have correlation
+    if team_counts.max() < 2 and game_counts.max() < 2:
+        return False
+
+    # Ownership control
+    if (lineup_df['OwnershipProb'] > 0.25).sum() > 2:
+        return False
+
+    # Must contain at least one true outlier
+    if lineup_df['OutlierEligible'].sum() < 1:
+        return False
+
+    return True
 
 def lineup_sanity_checks(lineups: list[pd.DataFrame]):
     """
@@ -2641,6 +2745,37 @@ def apply_injury_minutes_adjustment(base_minutes: float, injury_status: str) -> 
     adj = INJURY_MINUTE_ADJUSTMENTS.get(s, 0)
     return max(0.0, base_minutes + adj)
 
+def build_field_sims_once(
+    df,
+    n_sims=3000,
+    field_size=20000,
+):
+    """
+    Build reusable field simulations ONCE per slate
+    """
+    # Approximate field distribution from projections + volatility
+    field_means = df.groupby("LineupID")["MC_Mean"].sum() if "LineupID" in df else None
+
+    # Simple, fast field model
+    field_sims = np.random.normal(
+        loc=265,      # typical DK GPP mean
+        scale=22,     # realistic field spread
+        size=(n_sims, field_size)
+    )
+
+    # Cash field is tighter
+    field_cash = np.random.normal(
+        loc=255,
+        scale=14,
+        size=(n_sims, field_size)
+    )
+
+    # Hard realism caps
+    field_sims = np.clip(field_sims, 160, 360)
+    field_cash = np.clip(field_cash, 180, 320)
+
+    return field_sims, field_cash
+
 # -------------------------
 # CLI entrypoint
 # -------------------------
@@ -2699,6 +2834,14 @@ def main():
     if df.empty:
         print("❌ No projections created.")
         return
+    
+    print("🎲 Building field simulations ONCE per slate")
+
+    FIELD_SIMS, FIELD_CASH = build_field_sims_once(
+        df=df,
+        n_sims=3000,
+        field_size=20000
+    )
     #-----------------------------
     # Tuning for the win
     #----------------------------
@@ -2725,6 +2868,8 @@ def main():
         # -------------------------
         lineups = generate_gpp_lineups_recycling(
             df=df,
+            field_sims=FIELD_SIMS,
+            field_cash=FIELD_CASH,
             n_lineups=50,
             start_cash=0.18
         )
@@ -2741,6 +2886,41 @@ def main():
         #print("DEBUG summary columns:", summary.columns.tolist())       #delete after running
         print("SUMMARY COLUMNS:", summary.columns.tolist())  
         print(summary.head())           #delete after running
+
+        # ============================
+        # STEP 5 — PORTFOLIO SELECTION
+        # ============================
+
+        TOTAL_ENTRIES = 150  # or whatever you’re entering
+
+        PORTFOLIO_CAPS = {
+            "CORE": 0.35,
+            "ALT_STACK": 0.25,
+            "CHAOS": 0.20,
+            "YOLO": 0.10,
+            "HEDGE": 0.10
+        }
+
+        final_lineups = []
+
+        for bucket, pct in PORTFOLIO_CAPS.items():
+            bucket_pool = [
+                l for l in lineups
+                if l.get("Bucket") == bucket
+            ]
+
+            if not bucket_pool:
+                continue
+            
+            n = max(1, int(TOTAL_ENTRIES * pct))
+
+            bucket_pool = sorted(
+                bucket_pool,
+                key=lambda x: x["MillyScore"],
+                reverse=True
+            )
+
+            final_lineups.extend(bucket_pool[:n])
 
         # -------------------------
         # 3️⃣ Filter + sort
