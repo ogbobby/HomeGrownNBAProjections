@@ -1063,6 +1063,68 @@ def evaluate_lineups_mc(lineups, n_sims=3000, field_size=20000, cash_rate=0.18):
 
     return pd.DataFrame(rows).set_index("Lineup")
 
+def select_milly_lineups(
+    summary_df: pd.DataFrame,
+    lineups: list[pd.DataFrame],
+    n_select: int = 10,
+    min_top1: float = 0.08,
+    min_mean: float = 260,
+    max_overlap: int = 6
+):
+    """
+    Select final GPP entries from evaluated lineups.
+    Safe post-processing only.
+    """
+
+    df = summary_df.copy()
+
+    # -------------------------
+    # 1️⃣ Hard filters (reality)
+    # -------------------------
+    df = df[
+        (df["P_Top1"] >= min_top1) &
+        (df["Lineup_Mean"] >= min_mean)
+    ]
+
+    if df.empty:
+        print("⚠️ No lineups passed filters — relaxing constraints")
+        df = summary_df.sort_values("MillyScore", ascending=False).head(n_select)
+
+    # -------------------------
+    # 2️⃣ Rank by true win equity
+    # -------------------------
+    df = df.sort_values("MillyScore", ascending=False)
+
+    selected = []
+    used_players = []
+
+    # -------------------------
+    # 3️⃣ Diversity constraint
+    # -------------------------
+    for lineup_id in df.index:
+        lineup = lineups[lineup_id - 1]  # LineupID is 1-based
+
+        player_ids = set(lineup["PlayerID"])
+
+        # overlap check
+        if used_players:
+            overlap = max(
+                len(player_ids & prev)
+                for prev in used_players
+            )
+            if overlap > max_overlap:
+                continue
+
+        selected.append(lineup.assign(EntryRank=len(selected)+1))
+        used_players.append(player_ids)
+
+        if len(selected) >= n_select:
+            break
+
+    print(f"✅ Selected {len(selected)} Milly-ready lineups")
+
+    return selected
+
 # -------------------------
 # Core projection class
 # -------------------------
@@ -2883,7 +2945,18 @@ def main():
         # -------------------------
         
         summary = evaluate_lineups_mc(lineups)
-        #print("DEBUG summary columns:", summary.columns.tolist())       #delete after running
+        final_entries = select_milly_lineups(
+            summary_df=summary,
+            lineups=lineups,
+            n_select=10,        # change to 5, 20, etc
+            min_top1=0.08,
+            min_mean=260,
+            max_overlap=6
+        )
+        final_df = pd.concat(final_entries)
+        final_df.to_csv("final_milly_entries.csv", index=False)
+        print("📤 Saved final_milly_entries.csv")
+
         print("SUMMARY COLUMNS:", summary.columns.tolist())  
         print(summary.head())           #delete after running
 
